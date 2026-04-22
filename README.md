@@ -1,6 +1,125 @@
 # Observability Agent
 
-An AI-powered observability system that monitors a live web service, analyses logs per service, classifies incidents by severity, and takes autonomous action — paging on-call engineers for critical failures and sending email alerts for all severity levels.
+An AI-powered observability system that monitors a live web service, analyses logs per service using contextual reasoning, and takes autonomous incident response actions — paging on-call engineers via Slack for critical failures and logging all events to PostgreSQL.
+
+---
+
+## High-Level Architecture Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         USER / OPERATOR                             │
+│                              │    ▲                                 │
+│                  python agent.py  │  React Dashboard                │
+│                              │    │  localhost:5173                 │
+└──────────────────────────────┼────┼─────────────────────────────────┘
+                               │    │
+           ┌───────────────────▼────┴────────────────────┐
+           │              agent.py                        │
+           │          (MCP Client · Gemini 2.5 Flash)     │
+           │                                              │
+           │  1. Spawns mcp_server.py via stdio           │
+           │  2. Discovers tools dynamically              │
+           │  3. Sends prompt + tools to Gemini           │
+           │  4. Gemini reasons → returns tool call       │
+           │  5. Forwards call to MCP server              │
+           │  6. Returns result to Gemini                 │
+           │  7. Repeats until final report               │
+           └──────────────────┬───────────────────────────┘
+                    stdio (MCP Protocol)
+           ┌──────────────────▼───────────────────────────┐
+           │            mcp_server.py                     │
+           │            (MCP Server)                      │
+           │                                              │
+           │  Tools:                                      │
+           │  ┌─────────────────────────────────────┐    │
+           │  │ get_logs          → reads PostgreSQL │    │
+           │  │ raise_alert       → writes alerts    │    │
+           │  │ save_metrics      → writes metrics   │    │
+           │  │ send_email        → writes alerts    │    │
+           │  │ call_on_call  ────────────────────────────┼──▶ Slack
+           │  └─────────────────────────────────────┘    │   (SEV-1 only)
+           └──────────────────┬───────────────────────────┘
+                              │ reads / writes
+           ┌──────────────────▼───────────────────────────┐
+           │               PostgreSQL                     │
+           │           "observability" DB                 │
+           │                                              │
+           │  logs         ← FastAPI service traffic      │
+           │  metrics      ← agent analysis results       │
+           │  alerts       ← every severity assessment    │
+           │  agent_runs   ← full MCP tool-call audit     │
+           └──────────────────┬───────────────────────────┘
+                              │ /dashboard/* REST API
+           ┌──────────────────▼───────────────────────────┐
+           │  mock_app/main.py  +  mock_app/dashboard.py  │
+           │  FastAPI · localhost:8000                     │
+           │                                              │
+           │  Generates live traffic → logs table         │
+           │  Serves dashboard data → React frontend      │
+           └──────────────────────────────────────────────┘
+```
+
+### End-to-End Flow
+
+```
+FastAPI service generates traffic
+        │
+        ▼
+HTTP middleware logs every request → PostgreSQL (logs table)
+        │
+        ▼
+Operator runs: python agent.py
+        │
+        ├─ agent spawns mcp_server.py (stdio)
+        ├─ agent discovers tools via MCP list_tools()
+        ├─ agent sends prompt to Gemini 2.5 Flash
+        │
+        ▼
+Gemini reasons over log data
+        │
+        ├─ calls get_logs via MCP ──────────────▶ PostgreSQL (reads logs)
+        │
+        ├─ assesses each service (contextual, not threshold-based)
+        │
+        ├─ SEV-1 service? ──── call_on_call via MCP ──▶ Slack alert sent
+        │
+        ├─ every service ────── raise_alert via MCP ──▶ PostgreSQL (alerts)
+        │
+        ├─ once ─────────────── send_email via MCP ───▶ PostgreSQL (alerts)
+        │
+        ├─ once ─────────────── save_metrics via MCP ─▶ PostgreSQL (metrics)
+        │
+        └─ writes final incident report to terminal
+                │
+                ▼
+        React Dashboard polls /dashboard/* every 10s
+        and displays metrics, alerts, and agent activity
+```
+
+---
+
+## What Is MCP and Why Is It Used Here?
+
+**MCP (Model Context Protocol)** is an open standard for connecting AI models to external tools and data sources. Instead of hardcoding tool functions inside the agent, MCP separates them into a standalone server process that the agent connects to at runtime.
+
+**Before MCP (old approach):**
+```
+agent.py  →  import tools.py  →  call function directly
+```
+The agent knew everything about the tools: their Python code, their schemas. Tightly coupled.
+
+**With MCP (current approach):**
+```
+agent.py (MCP client)  ──stdio──▶  mcp_server.py (MCP server)  →  tools.py
+```
+The agent connects to the MCP server, asks "what tools do you have?", gets back schemas, and routes all calls through the protocol. The agent has no tool logic — it just sends requests and receives results.
+
+**Why this matters:**
+- Tools are decoupled from the agent — you can update, add, or swap tools without touching the agent
+- The MCP server can be shared with any MCP-compatible client (Claude Desktop, other agents)
+- Tool schemas are the single source of truth — defined once in the server, discovered dynamically
+- Clean separation: agent owns reasoning, MCP server owns execution
 
 ---
 
@@ -11,45 +130,127 @@ An AI-powered observability system that monitors a live web service, analyses lo
 │                        Mock FastAPI Service                          │
 │                         mock_app/main.py                             │
 │                                                                      │
-│  /api/payments   /api/orders   /api/users   /api/products   /health  │
-│       │                │             │            │                  │
-│       └────────────────┴─────────────┴────────────┘                 │
-│                   HTTP middleware auto-logs every request            │
-│                                  │                                   │
-│                          PostgreSQL: logs table                      │
-│                                  │                                   │
-│          Background: traffic_simulator.py (auto-generates load)      │
-└──────────────────────────────────┬───────────────────────────────────┘
-                                   │ fetch_logs()
-                                   ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│                       Observability Agent                            │
-│                    agent.py  ·  Gemini 2.5 Flash                     │
+│  /api/payments  /api/orders  /api/users  /api/products  /health      │
+│       └──────────────────────┬───────────────────────────┘          │
+│              HTTP middleware auto-logs every request                 │
+│                              │                                       │
+│                     PostgreSQL: logs table                           │
+│              Background: traffic_simulator.py                        │
+└──────────────────────────────┬───────────────────────────────────────┘
+                               │
+                               │
+┌──────────────────────────────▼───────────────────────────────────────┐
+│                     agent.py  (MCP Client)                           │
+│                   Gemini 2.5 Flash · ReAct Loop                      │
 │                                                                      │
-│   1. get_logs()          → aggregated stats + per-service breakdown  │
-│   2. (per service)       → classify SEV-1 / 2 / 3 / 4               │
-│   3. call_on_call_engineer()  → SEV-1 services only                 │
-│   4. raise_alert()            → every service                        │
-│   5. send_email_notification() → one summary email                  │
-│   6. save_metrics()           → persist run results                 │
-│   7. Final incident report                                           │
-└─────────────┬────────────────────────────────┬───────────────────────┘
-              │ SEV-1 only                      │ all severities
-              ▼                                 ▼
-   ┌─────────────────────┐          ┌──────────────────────────┐
-   │     on_call.py      │          │       PostgreSQL          │
-   │  Mock PagerDuty /   │          │  metrics · alerts ·      │
-   │  OpsGenie pager     │          │  agent_runs tables       │
-   │  Incident raised    │          └──────────────────────────┘
-   │  Engineer paged     │                     │
-   └─────────────────────┘                     │ REST API (/dashboard/*)
-                                               ▼
-                                  ┌────────────────────────┐
-                                  │   React Dashboard      │
-                                  │   dashboard/src/       │
-                                  │   Vite · localhost:5173│
-                                  └────────────────────────┘
+│  1. Connect to MCP server via stdio                                  │
+│  2. list_tools()  →  discover schemas dynamically                    │
+│  3. Convert MCP schemas → Gemini FunctionDeclarations                │
+│  4. Send logs + prompt to Gemini                                     │
+│  5. Gemini reasons → returns function call                           │
+│  6. call_tool(name, args) via MCP → get result → send back to Gemini │
+│  7. Repeat until Gemini produces final report                        │
+└──────────────────────┬───────────────────────────────────────────────┘
+           stdio (MCP) │
+┌──────────────────────▼───────────────────────────────────────────────┐
+│                   mcp_server.py  (MCP Server)                        │
+│                  "observability-mcp"                                 │
+│                                                                      │
+│  Tools exposed:                                                      │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │  get_logs               fetch aggregated stats from Postgres │   │
+│  │  raise_alert            persist severity assessment to DB    │   │
+│  │  send_email_notification  mock email (logged to DB)          │   │
+│  │  save_metrics           persist analysis metrics to DB       │   │
+│  │  call_on_call_engineer  SEV-1 → Slack Incoming Webhook       │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                    │                         │                       │
+│               tools.py               slack_notify.py                │
+└──────────────────────────────────────────────────────────────────────┘
+                       │                         │
+            ┌──────────▼──────────┐    ┌─────────▼────────┐
+            │     PostgreSQL      │    │   Slack Channel   │
+            │ logs · metrics ·    │    │  (SEV-1 only)     │
+            │ alerts · agent_runs │    └──────────────────┘
+            └──────────┬──────────┘
+                       │  REST API (/dashboard/*)
+            ┌──────────▼──────────┐
+            │   React Dashboard   │
+            │  dashboard/src/     │
+            │  localhost:5173     │
+            └─────────────────────┘
 ```
+
+---
+
+## How the MCP Flow Works (Step by Step)
+
+```
+agent.py                        mcp_server.py                   tools.py / Slack
+   │                                 │                               │
+   │── stdio_client.connect() ──────▶│                               │
+   │◀─ session.initialize() ────────│                               │
+   │                                 │                               │
+   │── session.list_tools() ────────▶│                               │
+   │◀─ [get_logs, raise_alert, ...]──│                               │
+   │                                 │                               │
+   │  (convert schemas → Gemini)     │                               │
+   │  (send prompt to Gemini)        │                               │
+   │  (Gemini returns: call get_logs)│                               │
+   │                                 │                               │
+   │── session.call_tool(            │                               │
+   │     "get_logs", {minutes: 30}) ▶│── _get_logs(30) ────────────▶│
+   │                                 │◀─ aggregated JSON ────────────│
+   │◀─ TextContent(json) ────────────│                               │
+   │                                 │                               │
+   │  (send result back to Gemini)   │                               │
+   │  (Gemini reasons → SEV-1 found) │                               │
+   │  (Gemini returns: call_on_call) │                               │
+   │                                 │                               │
+   │── session.call_tool(            │                               │
+   │     "call_on_call_engineer",...▶│── notify_slack(service) ─────▶│
+   │                                 │                               │──▶ Slack POST
+   │◀─ incident JSON ────────────────│◀──────────────────────────────│
+   │                                 │                               │
+   │  ... (raise_alert × N,          │                               │
+   │        send_email, save_metrics)│                               │
+   │                                 │                               │
+   │  (Gemini writes final report)   │                               │
+   │── session closes ───────────────│                               │
+```
+
+---
+
+## Severity Classification
+
+The agent uses **contextual reasoning**, not fixed numeric thresholds. It weighs:
+
+| Signal | What the agent considers |
+|--------|--------------------------|
+| **Service criticality** | Payment and auth services have higher stakes than product or health endpoints |
+| **Error rate in context** | 5% errors on payments is more alarming than 20% on a health check |
+| **Error volume** | 30 errors on 31 requests vs 30 errors on 3000 requests |
+| **Latency** | Elevated latency without errors often signals resource exhaustion before failures appear |
+| **Error type** | 5xx (server-side) are more severe than 4xx (client errors); 503s indicate unavailability |
+| **Spread** | Errors in one service vs degradation across many services changes the blast radius |
+
+**Severity levels (guide, not formula):**
+
+| Level | Label | Meaning |
+|-------|-------|---------|
+| **SEV-1** | CRITICAL | Service effectively down. Widespread user impact. Immediate intervention required. |
+| **SEV-2** | HIGH | Significant degradation. Meaningful portion of users affected. Prompt attention needed. |
+| **SEV-3** | MEDIUM | Partial/intermittent degradation. Most users unaffected. Needs investigation. |
+| **SEV-4** | LOW | Minor anomaly. System healthy overall. Monitor. |
+
+**Actions by severity:**
+
+| Severity | Slack (on-call page) | DB Alert | Email |
+|----------|:-------------------:|:--------:|:-----:|
+| SEV-1 CRITICAL | ✅ | ✅ | ✅ |
+| SEV-2 HIGH | — | ✅ | ✅ |
+| SEV-3 MEDIUM | — | ✅ | ✅ |
+| SEV-4 LOW | — | ✅ | ✅ |
 
 ---
 
@@ -57,118 +258,36 @@ An AI-powered observability system that monitors a live web service, analyses lo
 
 ```
 app_agent/
-├── agent.py                  # Gemini 2.5 Flash agent — reasoning + action loop
-├── on_call.py                # Mock PagerDuty/OpsGenie on-call pager
-├── tools.py                  # 5 agent tools + Gemini function declarations
-├── seed_mock_data.py         # Seed historical data (one run per severity)
-├── run_all_severities.py     # Live test runner: cycles through all 4 severities
+├── agent.py              # MCP client · Gemini 2.5 Flash · async agent loop
+├── mcp_server.py         # MCP server · exposes all tools over stdio
+├── tools.py              # Tool implementations (imported by mcp_server.py)
+├── slack_notify.py       # SEV-1 Slack Incoming Webhook sender
+├── seed_mock_data.py     # Seed historical data (one run per severity level)
+├── run_all_severities.py # Live test: cycles through all 4 severity scenarios
 ├── requirements.txt
+├── .env                  # GEMINI_API_KEY + SLACK_WEBHOOK_URL (git-ignored)
 └── mock_app/
-    ├── __init__.py
-    ├── main.py               # FastAPI service — endpoints + request logging middleware
-    ├── database.py           # PostgreSQL schema + all DB helpers
-    ├── dashboard.py          # REST API router that feeds the React dashboard
+    ├── main.py           # FastAPI service · endpoints · request logging middleware
+    ├── database.py       # PostgreSQL schema + all DB helpers
+    ├── dashboard.py      # REST API router for the React dashboard
     └── traffic_simulator.py  # Background async traffic generator
 └── dashboard/
     └── src/
-        ├── App.jsx           # React dashboard — metrics, alerts, agent activity
+        ├── App.jsx       # React dashboard · auto-refreshes every 10s
         ├── main.jsx
         └── index.css
 ```
 
 ---
 
-## How It Works
-
-### 1. Mock FastAPI Service (`mock_app/main.py`)
-Simulates a real production service with multiple endpoints. Every request is automatically logged to PostgreSQL via HTTP middleware. The service randomly produces both successful and error responses at configurable rates.
-
-**Endpoints:**
-
-| Method | Path | Simulated Error Rate |
-|--------|------|---------------------|
-| GET | `/health` | 0% |
-| GET | `/api/users` | 20% (500) |
-| GET | `/api/users/{id}` | 10% (500) + 15% (404) |
-| POST | `/api/orders` | 25% (400/500/503) |
-| GET | `/api/orders/{id}` | 18% (500/503) + 12% (404) |
-| GET | `/api/payments/{id}` | 30% (500/503/502) + 10% (404) |
-| POST | `/api/payments` | 35% (500/503/422) |
-| GET | `/api/products` | 8% (500) |
-| GET | `/api/inventory/{id}` | 22% (500/503) |
-| POST | `/simulate/spike-errors` | Injects 10 error logs directly |
-| POST | `/simulate/critical` | Injects 20 Sev-1 critical logs directly |
-
-**Traffic simulator** runs as a background async task, cycling through four phases:
-
-| Phase | Req/s | Description |
-|-------|------:|-------------|
-| `NORMAL` | 0.3 | Healthy baseline |
-| `DEGRADED` | 0.3 | Elevated errors, slower responses |
-| `SPIKE` | 0.8 | Heavy burst with many failures |
-| `RECOVERY` | 0.2 | Errors subsiding |
-
-### 2. Observability Agent (`agent.py`)
-Powered by **Gemini 2.5 Flash**, the agent runs an autonomous reasoning + action loop. Each run is fully logged to `agent_runs` for audit.
-
-**Agent loop steps:**
-1. Call `get_logs` once — returns overall stats plus a per-service breakdown
-2. For each service in the breakdown, classify its severity independently
-3. For any SEV-1 service, call `call_on_call_engineer`
-4. Call `raise_alert` for every service with its individual severity
-5. Call `send_email_notification` once, summarising all services
-6. Call `save_metrics` once with the overall stats and highest severity found
-7. Write a concise incident report
-
-### 3. Severity Classification
-
-Classification is done **per service**, independently:
-
-| Level | Label | Trigger Condition |
-|-------|-------|-------------------|
-| **SEV-1** | CRITICAL | error_rate > 30% **OR** avg latency > 2000ms |
-| **SEV-2** | HIGH | error_rate 15–30% **OR** avg latency 1000–2000ms |
-| **SEV-3** | MEDIUM | error_rate 5–15% **OR** avg latency 500–1000ms |
-| **SEV-4** | LOW | error_rate < 5% **AND** avg latency < 500ms |
-
-### 4. Actions by Severity
-
-| Severity | On-Call Page | Raise Alert | Send Email |
-|----------|:-----------:|:-----------:|:----------:|
-| SEV-1 CRITICAL | ✅ | ✅ | ✅ (included in summary) |
-| SEV-2 HIGH | — | ✅ | ✅ (included in summary) |
-| SEV-3 MEDIUM | — | ✅ | ✅ (included in summary) |
-| SEV-4 LOW | — | ✅ | ✅ (included in summary) |
-
-### 5. On-Call Engineer (`on_call.py`)
-Simulates PagerDuty/OpsGenie. On a SEV-1 trigger it:
-- Randomly selects an engineer from the mock roster (Alice Chen, Bob Martinez, Priya Sharma)
-- Generates a timestamped incident ID (`INC-YYYYMMDD-NNNN`)
-- Prints a full incident banner to the terminal
-- Persists the escalation to the `alerts` table with `alert_type = 'ONCALL'`
-- Returns structured incident data (incident ID, engineer name, contact, ack URL)
-
-### 6. Dashboard API (`mock_app/dashboard.py`)
-FastAPI router mounted at `/dashboard/*`. The React frontend polls these endpoints every 10 seconds:
-
-| Endpoint | Returns |
-|----------|---------|
-| `GET /dashboard/summary` | Header stats: error rate, avg latency, on-call pages, latest severity |
-| `GET /dashboard/logs` | Recent log rows (last 60 min, up to 100) |
-| `GET /dashboard/metrics` | Agent analysis history (last 20 runs) |
-| `GET /dashboard/alerts` | All raised alerts, emails, and on-call pages (last 50) |
-| `GET /dashboard/agent-runs` | Full agent activity audit trail (last 100 events) |
-
----
-
 ## Database Schema
 
-Four tables are created automatically on first run in the `observability` PostgreSQL database.
+Four tables created automatically on first run.
 
 **`logs`** — every request from the FastAPI service
 ```
 id | timestamp | endpoint | method | status_code | response_time_ms
-   | log_level | message | request_id | error_detail
+   | log_level | message  | request_id | error_detail
 ```
 
 **`metrics`** — each agent analysis run result
@@ -182,7 +301,7 @@ id | timestamp | window_minutes | total_requests | error_count | success_count
 id | timestamp | severity | service | message | alert_type (RAISE_ALERT | EMAIL | ONCALL) | status
 ```
 
-**`agent_runs`** — full audit trail of every agent action
+**`agent_runs`** — full MCP tool-call audit trail
 ```
 id | timestamp | run_id | event_type (RUN_START | TOOL_CALL | TOOL_RESULT | FINAL_REPORT)
    | tool_name | tool_input | tool_result | severity | message
@@ -193,9 +312,10 @@ id | timestamp | run_id | event_type (RUN_START | TOOL_CALL | TOOL_RESULT | FINA
 ## Prerequisites
 
 - Python 3.10+
-- Node.js 18+ (for the React dashboard)
+- Node.js 18+ (React dashboard)
 - PostgreSQL running locally
-- A Gemini API key — get one free at [aistudio.google.com](https://aistudio.google.com/app/apikey)
+- Gemini API key — [aistudio.google.com](https://aistudio.google.com/app/apikey)
+- Slack Incoming Webhook URL — [api.slack.com/apps](https://api.slack.com/apps)
 
 ---
 
@@ -210,22 +330,15 @@ psql -U postgres -c "CREATE DATABASE observability;"
 ### Step 2 — Install Python dependencies
 
 ```bash
-cd app_agent
 pip install -r requirements.txt
 ```
 
-### Step 3 — Configure your Gemini API key
+### Step 3 — Configure environment variables
 
-Open [agent.py](agent.py) and set your key on line 40:
-
-```python
-GEMINI_API_KEY = "your_key_here"
+Edit [.env](.env):
 ```
-
-Or export it as an environment variable (takes precedence over the file):
-
-```bash
-export GEMINI_API_KEY="your_key_here"
+GEMINI_API_KEY=your_gemini_key_here
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
 ```
 
 ### Step 4 — Start the mock FastAPI service
@@ -234,197 +347,128 @@ export GEMINI_API_KEY="your_key_here"
 uvicorn mock_app.main:app --reload --port 8000
 ```
 
-On startup this will:
-- Create all four DB tables if they don't exist
-- Start the background traffic simulator automatically
+This creates DB tables, starts the traffic simulator in the background, and serves the dashboard API at `http://localhost:8000/dashboard/*`.
 
 ### Step 5 — Run the agent
-
-In a new terminal:
 
 ```bash
 # Analyse the last 30 minutes (default)
 python agent.py
 
-# Analyse a custom window
+# Custom window
 python agent.py 60
 ```
+
+**What happens internally:**
+1. `agent.py` launches `mcp_server.py` as a subprocess (stdio)
+2. Calls `list_tools()` — receives all 5 tool schemas from the MCP server
+3. Converts schemas to Gemini function declarations dynamically
+4. Sends the prompt to Gemini with the discovered tools
+5. For each tool call Gemini makes, forwards it to the MCP server via `call_tool()`
+6. MCP server executes the tool and returns the result
+7. Result is sent back to Gemini to continue reasoning
+
+You do **not** need to start `mcp_server.py` manually — the agent starts and stops it automatically.
 
 ### Step 6 — Start the React dashboard (optional)
 
 ```bash
 cd dashboard
-npm install
-npm run dev
+npm run dev          # node_modules already installed
 ```
 
-Open `http://localhost:5173` in your browser. The dashboard auto-refreshes every 10 seconds.
+Open `http://localhost:5173`. The dashboard polls `http://localhost:8000/dashboard/*` every 10 seconds.
 
 ---
 
 ## Testing
 
-### Option A — Seed historical mock data (no agent run needed)
+### Option A — Seed historical data
 
-Inserts pre-built historical records for all four severities directly into `metrics`, `alerts`, and `agent_runs`. Useful for populating the dashboard without running the agent live.
+Inserts pre-built records for all four severities without running the agent live:
 
 ```bash
 python seed_mock_data.py
 ```
 
-This inserts:
-- **4 metrics rows** — SEV-1 @ 200 min ago, SEV-2 @ 150 min, SEV-3 @ 100 min, SEV-4 @ 60 min
-- **9 alert rows** — ONCALL + RAISE_ALERT + EMAIL for SEV-1; RAISE_ALERT + EMAIL for SEV-2/3/4
-- **42 agent_run rows** — full audit trail for all four historical runs
+Inserts: 4 metrics rows · 9 alert rows · 42 agent_run rows.
 
-### Option B — Run all four severity scenarios live
-
-Seeds fresh log data for each severity level and runs the agent against it sequentially.
+### Option B — Live four-scenario test
 
 ```bash
 python run_all_severities.py
 ```
 
-This will:
-1. Truncate the `logs` table
-2. Insert log rows calibrated for SEV-1 (40% error rate, ~2470ms avg latency)
-3. Run the agent — expect one on-call page + alerts + email
-4. Repeat for SEV-2, SEV-3, SEV-4 with a 5-second pause between each
+Seeds log data for each severity level and runs the agent sequentially (SEV-1 → SEV-2 → SEV-3 → SEV-4).
 
-### Option C — Trigger a critical scenario against the live service
-
-With the FastAPI service running, inject 20 critical error logs instantly:
+### Option C — Force a SEV-1 via the live service
 
 ```bash
+# Inject 20 critical errors
 curl -X POST http://localhost:8000/simulate/critical
-```
 
-Then run the agent:
-
-```bash
+# Run the agent — should trigger Slack alert
 python agent.py
 ```
 
 ---
 
-## Verifying On-Call Is Triggered
+## Verifying the Slack On-Call Alert
 
-The on-call page fires **only for SEV-1** (error rate > 30% **or** avg latency > 2000ms on any single service).
+The Slack alert fires **only for SEV-1** services (agent's judgment, not a fixed threshold).
 
-### What to look for in the terminal
-
-When the agent runs against a SEV-1 condition, you will see this banner printed mid-run:
-
+**Terminal — look for this banner mid-run:**
 ```
 ======================================================================
-  *** SEV-1 CRITICAL INCIDENT RAISED ***
+  *** SEV-1 CRITICAL — SLACK ALERT SENT ***
 ======================================================================
-  Incident ID  : INC-20260415-0001
-  Service      : payment-service
-  Time         : 2026-04-15T22:23:48
-  Message      : CRITICAL: Payment service error rate is 35.0% and average
-                 response time is 2800ms. Immediate action required.
-  On-Call      : Priya Sharma (Infra On-Call)
-  Contact      : +1-555-0103
-  Ack URL      : https://oncall.internal/incidents/INC-20260415-0001/ack
-  Status       : PAGED
+  Incident ID : INC-20260421-212328
+  Service     : payment-service
+  Time        : 2026-04-21T21:23:28
+  Message     : CRITICAL: Payment service ...
+  Channel     : Slack (Incoming Webhook)
+  Status      : SENT
 ======================================================================
 ```
 
-### What to check in the database
-
+**Database — confirm the on-call page was persisted:**
 ```sql
--- Confirm the on-call escalation was persisted
+-- See all on-call escalations
 SELECT id, timestamp, severity, service, message, alert_type
 FROM   alerts
 WHERE  alert_type = 'ONCALL'
 ORDER  BY timestamp DESC
 LIMIT  5;
 
--- Check the agent correctly classified the run as SEV-1
-SELECT timestamp, severity_assessment, error_rate, avg_response_time_ms, analysis_summary
+-- Confirm SEV-1 assessment was saved
+SELECT timestamp, severity_assessment, error_rate, analysis_summary
 FROM   metrics
 ORDER  BY timestamp DESC
-LIMIT  5;
+LIMIT  3;
 
--- Review the agent's full tool-call audit trail for the run
+-- Inspect the full MCP tool-call audit trail for a run
 SELECT event_type, tool_name, severity, message
 FROM   agent_runs
-WHERE  run_id = '<run-id-from-terminal>'
+WHERE  run_id = '<run-id-shown-in-terminal>'
 ORDER  BY timestamp;
 ```
 
-### What to check in the dashboard
-
-- **Header cards** — "On-Call Pages Total" counter increments
-- **Alerts tab** — a row with `alert_type = ONCALL` appears at the top
-- **Agent Activity tab** — shows `TOOL_CALL call_on_call_engineer` in the audit trail for that run
-
-### Confirm no false pages (non-SEV-1 runs)
-
-```sql
--- Should return 0 rows for any run that wasn't SEV-1
-SELECT a.alert_type, a.severity, a.service, a.timestamp
-FROM   alerts a
-WHERE  a.alert_type = 'ONCALL'
-  AND  a.severity  != 1;
-```
+**Dashboard — check:**
+- Header card "On-Call Pages Total" incremented
+- Alerts tab shows `alert_type = ONCALL` row at the top
+- Agent Activity tab shows `TOOL_CALL call_on_call_engineer` in the run
 
 ---
 
-## Example Agent Output (Full SEV-1 Run)
+## MCP Tool Summary
 
-```
-======================================================================
-  OBSERVABILITY AGENT  –  Analysing last 30 minutes
-  Model: gemini-2.5-flash  |  Run ID: 7a09af74
-======================================================================
-
-[Agent] Iteration 1
-[Tool Call] get_logs({"timeframe_minutes": 30})
-[Tool Result] {
-  "overall": {"total_requests": 26, "error_count": 8, "error_rate_pct": 30.8, "avg_response_time_ms": 1850.0},
-  "services": [
-    {"service": "payment-service", "error_rate_pct": 40.0, "avg_response_time_ms": 2470.0},
-    {"service": "order-service",   "error_rate_pct": 22.2, "avg_response_time_ms": 1378.0},
-    {"service": "user-service",    "error_rate_pct": 11.1, "avg_response_time_ms": 596.0},
-    {"service": "product-service", "error_rate_pct":  0.0, "avg_response_time_ms": 200.0}
-  ]
-}
-
-[Agent] Iteration 2
-[Tool Call] call_on_call_engineer({"service": "payment-service", "message": "..."})
-
-======================================================================
-  *** SEV-1 CRITICAL INCIDENT RAISED ***
-======================================================================
-  Incident ID  : INC-20260415-0001
-  Service      : payment-service
-  On-Call      : Priya Sharma (Infra On-Call)
-  Contact      : +1-555-0103
-  Status       : PAGED
-======================================================================
-
-[Tool Call] raise_alert({"service": "payment-service", "severity": 1, ...})
-[Tool Call] raise_alert({"service": "order-service",   "severity": 2, ...})
-[Tool Call] raise_alert({"service": "user-service",    "severity": 3, ...})
-[Tool Call] raise_alert({"service": "product-service", "severity": 4, ...})
-
-[Agent] Iteration 3
-[Tool Call] send_email_notification({...})   # one summary email for all services
-[Tool Call] save_metrics({..., "severity_assessment": 1})
-
-[Agent] Iteration 4
-[Agent Response]
-  **Incident Report — payment-service (SEV-1 CRITICAL):** 40% error rate, 2470ms avg latency. On-call paged.
-  **order-service (SEV-2 HIGH):** 22% error rate, 1378ms avg latency.
-  **user-service (SEV-3 MEDIUM):** 11% error rate, 596ms avg latency.
-  **product-service (SEV-4 LOW):** Healthy — 0% errors, 200ms latency.
-
-======================================================================
-  AGENT RUN COMPLETE
-======================================================================
-```
+| Tool | When called | What it does |
+|------|-------------|--------------|
+| `get_logs` | Once at start | Fetches per-service error rate + latency from PostgreSQL |
+| `raise_alert` | Once per service | Persists the agent's severity assessment + reasoning to DB |
+| `call_on_call_engineer` | SEV-1 services only | Posts formatted Slack block message via Incoming Webhook |
+| `send_email_notification` | Once, after all alerts | Sends summary email (mock, logged to DB) |
+| `save_metrics` | Once at end | Persists overall analysis metrics and highest severity to DB |
 
 ---
 
@@ -433,8 +477,10 @@ WHERE  a.alert_type = 'ONCALL'
 | Package | Purpose |
 |---------|---------|
 | `fastapi` | Mock web service |
-| `uvicorn` | ASGI server for FastAPI |
+| `uvicorn` | ASGI server |
 | `psycopg2-binary` | PostgreSQL driver |
 | `google-genai` | Gemini 2.5 Flash SDK |
-| `httpx` | HTTP client |
+| `mcp` | Model Context Protocol — tool server + client |
+| `python-dotenv` | `.env` file support |
+| `httpx` | Slack webhook HTTP client |
 | `react` + `vite` | Dashboard frontend |

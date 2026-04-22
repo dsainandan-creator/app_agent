@@ -3,11 +3,11 @@ tools.py – Agent tool implementations.
 
 These are the concrete Python functions behind each Claude tool call.
 Tools available to the agent:
-  1. get_logs            – fetch recent logs from PostgreSQL
-  2. raise_alert         – persist an alert record in the DB
-  3. send_email_notification – mock email sender
-  4. save_metrics        – save analysis metrics to DB
-  5. call_on_call_engineer – escalate Sev-1 to the on-call engineer
+  1. get_logs                 – fetch recent logs from PostgreSQL
+  2. raise_alert              – persist an alert record in the DB
+  3. send_email_notification  – mock email sender
+  4. save_metrics             – save analysis metrics to DB
+  5. call_on_call_engineer    – escalate Sev-1 via Slack Incoming Webhook
 """
 
 import datetime
@@ -19,7 +19,7 @@ from mock_app.database import (
     save_alert,
     save_metrics_record,
 )
-from on_call import call_on_call_engineer as _page_engineer
+from slack_notify import notify_slack
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ def save_metrics(
 
 def call_on_call_engineer(service: str, message: str) -> str:
     """
-    Escalate a Sev-1 critical incident to the on-call engineer.
+    Escalate a Sev-1 critical incident via Slack Incoming Webhook.
     Also persists the escalation in the alerts DB.
 
     Args:
@@ -242,13 +242,12 @@ def call_on_call_engineer(service: str, message: str) -> str:
     Returns:
         Incident details as a JSON string.
     """
-    incident = _page_engineer(service=service, message=message)
+    incident = notify_slack(service=service, message=message)
 
-    # Also persist as an ONCALL alert
     save_alert(
         severity=1,
         service=service,
-        message=f"[ONCALL] {incident['incident_id']}: {message}",
+        message=f"[SLACK] {incident['incident_id']}: {message}",
         alert_type="ONCALL",
     )
 
