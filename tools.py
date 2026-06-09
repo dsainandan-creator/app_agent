@@ -83,6 +83,8 @@ def get_logs(timeframe_minutes: int = 30) -> str:
         })
 
     result = {
+        "source": "postgresql",
+        "status": "ok",
         "window_minutes": timeframe_minutes,
         "overall": {
             "total_requests": total,
@@ -99,6 +101,7 @@ def get_logs(timeframe_minutes: int = 30) -> str:
 # ---------------------------------------------------------------------------
 # Tool 2 – Raise alert (DB record)
 # ---------------------------------------------------------------------------
+
 
 def raise_alert(service: str, severity: int, message: str) -> str:
     """
@@ -133,7 +136,7 @@ def raise_alert(service: str, severity: int, message: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool 3 – Send email notification (mock)
+# Tool 4 – Send email notification (mock)
 # ---------------------------------------------------------------------------
 
 def send_email_notification(
@@ -180,7 +183,7 @@ def send_email_notification(
 
 
 # ---------------------------------------------------------------------------
-# Tool 4 – Save metrics
+# Tool 5 – Save metrics
 # ---------------------------------------------------------------------------
 
 def save_metrics(
@@ -227,7 +230,7 @@ def save_metrics(
 
 
 # ---------------------------------------------------------------------------
-# Tool 5 – Call on-call engineer
+# Tool 6 – Call on-call engineer
 # ---------------------------------------------------------------------------
 
 def call_on_call_engineer(service: str, message: str) -> str:
@@ -259,11 +262,11 @@ def call_on_call_engineer(service: str, message: str) -> str:
 # ---------------------------------------------------------------------------
 
 TOOL_FUNCTIONS: dict[str, Any] = {
-    "get_logs": get_logs,
-    "raise_alert": raise_alert,
+    "get_logs":                get_logs,
+    "raise_alert":             raise_alert,
     "send_email_notification": send_email_notification,
-    "save_metrics": save_metrics,
-    "call_on_call_engineer": call_on_call_engineer,
+    "save_metrics":            save_metrics,
+    "call_on_call_engineer":   call_on_call_engineer,
 }
 
 # Claude tool definitions (JSON schema)

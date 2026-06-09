@@ -5,7 +5,6 @@ DB: observability, User: postgres (no password)
 
 import psycopg2
 import psycopg2.extras
-from datetime import datetime
 
 DB_CONFIG = {
     "dbname": "observability",
@@ -101,7 +100,7 @@ def log_request(
     request_id: str,
     error_detail: str = None,
 ):
-    """Persist a single request log entry."""
+    """Persist a single request log entry to PostgreSQL and forward to Dynatrace."""
     if status_code >= 500:
         log_level = "ERROR"
     elif status_code >= 400:
@@ -137,6 +136,13 @@ def log_request(
     finally:
         cur.close()
         conn.close()
+
+    # Forward to Dynatrace (fire-and-forget — never blocks the caller)
+    try:
+        from dynatrace_client import ingest_log as _dt_ingest
+        _dt_ingest(endpoint, method, status_code, response_time_ms, message, request_id, error_detail)
+    except Exception:
+        pass
 
 
 def fetch_logs(window_minutes: int = 30) -> list[dict]:

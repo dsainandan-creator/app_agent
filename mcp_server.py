@@ -1,9 +1,9 @@
 """
 mcp_server.py – Observability MCP Server.
 
-Exposes all agent tools over the Model Context Protocol (stdio transport).
-The agent connects to this server as an MCP client and discovers tools
-dynamically — no tool schemas are hardcoded in the agent.
+Exposes PostgreSQL-backed observability tools over the Model Context Protocol
+(stdio transport). The agent also connects to a separate dynatrace_mcp_server.py
+for Dynatrace tools — this server owns PostgreSQL only.
 
 Tools exposed:
   get_logs                – Fetch aggregated log stats from PostgreSQL
@@ -14,7 +14,6 @@ Tools exposed:
 """
 
 import asyncio
-import sys
 
 import mcp.types as mcp_types
 from mcp.server import Server
@@ -31,15 +30,18 @@ from tools import (
 server = Server("observability-mcp")
 
 # ---------------------------------------------------------------------------
-# Tool schemas  (JSON Schema – converted to Gemini format by the agent)
+# Tool schemas
 # ---------------------------------------------------------------------------
 
 _TOOLS = [
     mcp_types.Tool(
         name="get_logs",
         description=(
-            "Get overall + per-service aggregated stats (error rate, latency) "
-            "for the last N minutes. Call once at the start of every analysis."
+            "Fetch overall + per-service aggregated stats (error_rate_pct, avg_response_time_ms, "
+            "total_requests, error_count) from PostgreSQL for the last N minutes. "
+            "Returns source='postgresql'. "
+            "Always call this first, then call dt_search_logs (Dynatrace MCP) with the same "
+            "timeframe before assigning any severity."
         ),
         inputSchema={
             "type": "object",
@@ -63,7 +65,7 @@ _TOOLS = [
             "properties": {
                 "service":  {"type": "string",  "description": "Affected service name."},
                 "severity": {"type": "integer", "description": "Assessed severity: 1=CRITICAL, 2=HIGH, 3=MEDIUM, 4=LOW."},
-                "message":  {"type": "string",  "description": "What you observed, why you chose this severity, and key metrics."},
+                "message":  {"type": "string",  "description": "What you observed, why you chose this severity, and key metrics from both PostgreSQL and Dynatrace."},
             },
             "required": ["service", "severity", "message"],
         },
@@ -80,7 +82,7 @@ _TOOLS = [
                 "recipient": {"type": "string",  "description": "Recipient email address."},
                 "severity":  {"type": "integer", "description": "Highest severity across all services (1–4)."},
                 "subject":   {"type": "string",  "description": "Email subject line."},
-                "body":      {"type": "string",  "description": "Full summary: all services, severities, and your reasoning."},
+                "body":      {"type": "string",  "description": "Full summary: all services, severities, data from both sources, and correlation reasoning."},
             },
             "required": ["recipient", "severity", "subject", "body"],
         },
@@ -95,13 +97,13 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "window_minutes":       {"type": "integer", "description": "Analysis window in minutes."},
-                "total_requests":       {"type": "integer", "description": "Total request count across all services."},
+                "total_requests":       {"type": "integer", "description": "Total request count across all services (use PostgreSQL total as the authoritative count)."},
                 "error_count":          {"type": "integer", "description": "Total 5xx error count."},
                 "success_count":        {"type": "integer", "description": "Total 2xx success count."},
                 "avg_response_time_ms": {"type": "number",  "description": "Overall average latency in ms."},
                 "error_rate":           {"type": "number",  "description": "Overall error rate 0–100."},
                 "severity_assessment":  {"type": "integer", "description": "Highest severity you found across all services (1–4)."},
-                "analysis_summary":     {"type": "string",  "description": "Brief plain-text summary of what you found and what actions were taken."},
+                "analysis_summary":     {"type": "string",  "description": "Plain-text summary including data from both sources and actions taken."},
             },
             "required": [
                 "window_minutes", "total_requests", "error_count", "success_count",
@@ -120,7 +122,7 @@ _TOOLS = [
             "type": "object",
             "properties": {
                 "service": {"type": "string", "description": "The failing service name."},
-                "message": {"type": "string", "description": "Critical failure description — include error rate, latency, and user impact."},
+                "message": {"type": "string", "description": "Critical failure description — include error rate, latency, and which data source confirmed it."},
             },
             "required": ["service", "message"],
         },
