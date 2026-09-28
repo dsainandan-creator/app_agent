@@ -1,0 +1,32 @@
+AGENT RUNBOOK — DECISION LOGIC AND ESCALATION FLOW
+====================================================
+
+What the Agent Does
+-------------------
+agent.py is a ReAct-loop agent powered by Gemini 2.5 Flash. It connects to two MCP
+servers over stdio, discovers their tools dynamically, and runs a structured 7-step
+analysis protocol on each invocation. It never hardcodes tool logic — all execution
+is delegated to the MCP servers.
+
+7-Step Protocol (followed in strict order)
+------------------------------------------
+1. Call get_logs(timeframe_minutes=N) via OBS-MCP to fetch PostgreSQL data.
+2. Call dt_search_logs(timeframe_minutes=N) via DT-MCP to fetch Dynatrace data.
+3. Output a CORRELATION SUMMARY table comparing both sources per service before
+   taking any action. Columns: service, PG err%, PG avg_ms, DT err%, DT avg_ms,
+   delta, resolution label (agreement / DT-lag / DT-higher / DT-unavailable).
+4. Assign a final severity per service using the more alarming signal.
+5. For any SEV-1 service: call call_on_call_engineer (triggers Slack page).
+   For every service at every severity: call raise_alert (DB record).
+6. Call send_email_notification once with the full correlation table.
+7. Call save_metrics once with PostgreSQL overall stats as authoritative counts.
+
+Escalation Logic
+----------------
+  SEV-1 → Slack page + DB alert + email
+  SEV-2 → DB alert + email (no page)
+  SEV-3 → DB alert + email
+  SEV-4 → DB alert + email
+
+If Dynatrace is unavailable (status != "ok"), the agent bases severity solely on
+PostgreSQL and explicitly notes the data gap in the report and email body.
