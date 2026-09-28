@@ -1,0 +1,30 @@
+DYNATRACE ALERTS — CONFIGURATION AND SEVERITY LEVELS
+======================================================
+
+Alert Types Configured
+----------------------
+The agent raises four alert types, all persisted to the PostgreSQL alerts table
+with an alert_type field that distinguishes them:
+
+  RAISE_ALERT  — formal severity assessment per service. Raised for every service
+                 the agent analyses, regardless of severity level (SEV-1 through SEV-4).
+                 Includes the service name, severity integer, and a plain-English
+                 description of the condition observed.
+
+  EMAIL        — summary notification sent once per agent run after all per-service
+                 alerts are raised. Contains the full correlation table, per-service
+                 severity assignments, and recommended actions.
+
+  ONCALL       — Slack escalation via Incoming Webhook. Fires only for SEV-1 services.
+                 Logged to the alerts table alongside the Slack delivery confirmation
+                 and incident ID (e.g. INC-20260615-143022).
+
+Severity Levels
+---------------
+  SEV-1 CRITICAL  service effectively down; widespread user impact; immediate action
+  SEV-2 HIGH      significant degradation; meaningful user impact; prompt response
+  SEV-3 MEDIUM    partial or intermittent issues; most users unaffected; investigate
+  SEV-4 LOW       minor anomaly; system healthy overall; monitor
+
+Severity is assigned by contextual reasoning, not fixed thresholds. Payment and
+auth services are weighted more heavily than health or product endpoints.

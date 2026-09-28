@@ -1,37 +1,45 @@
 """
-agent.py – Observability Agent powered by Google Gemini 2.5 Flash.
+agent.py – Observability Agent powered by Gemini 2.5 Flash + dual MCP.
 
-The agent follows a Reasoning → Action loop:
-  1. Call get_logs to retrieve aggregated log statistics.
-  2. Analyse the data and classify the overall severity (1–4).
-  3. Take the appropriate action based on severity:
-       Sev-1 (CRITICAL) → call on-call engineer + raise_alert + send_email
-       Sev-2 (HIGH)     → raise_alert + send_email
-       Sev-3 (MEDIUM)   → raise_alert + send_email
-       Sev-4 (LOW)      → raise_alert + send_email (lower priority)
-  4. Save analysis metrics to the database.
-  5. Produce a final summary.
+Architecture:
+  agent.py (MCP client)
+      ├──stdio──▶  mcp_server.py          (Observability MCP · PostgreSQL)
+      │                get_logs, raise_alert, send_email_notification,
+      │                save_metrics, call_on_call_engineer
+      └──stdio──▶  dynatrace_mcp_server.py (Dynatrace MCP · Dynatrace API)
+                       dt_ingest_log, dt_search_logs
 
-Severity classification rules:
-  Sev-1: error rate > 30% OR avg latency > 2000 ms
-  Sev-2: error rate 15–30% OR avg latency 1000–2000 ms
-  Sev-3: error rate 5–15% OR avg latency 500–1000 ms
-  Sev-4: error rate < 5% and latency < 500 ms
+The agent discovers tools from both servers at startup, merges them into a
+single Gemini tool list, then routes each call to the correct MCP server.
+No tool logic lives here — only routing, retry, and audit logging.
+
+Anti-hallucination design:
+  - Both read-tools (get_logs, dt_search_logs) return the same schema with
+    different source labels ("postgresql" vs "dynatrace").  The model cannot
+    invent which source said what.
+  - The system prompt instructs the agent to quote actual values from the
+    tool responses and never estimate figures not present in the data.
+  - If dt_search_logs returns status != "ok", the agent is instructed to
+    explicitly note the gap and rely solely on PostgreSQL.
 """
 
+import asyncio
 import json
 import os
 import re
 import sys
-import time
 import uuid
+from pathlib import Path
 
+import chromadb
+from chromadb.utils import embedding_functions
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-from tools import TOOL_FUNCTIONS
 from mock_app.database import log_agent_event
 
 load_dotenv()
@@ -41,115 +49,139 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-
-MODEL = "gemini-3-flash-preview"
-
+MODEL = "gemini-2.5-flash"
 ANALYSIS_WINDOW_MINUTES = 30
-ALERT_EMAIL = "oncall-team@company.internal"
 
-SYSTEM_PROMPT = """You are an Observability Agent. Analyse logs per service, classify severity, and alert.
+OBS_MCP_SERVER = Path(__file__).parent / "mcp_server.py"
+DT_MCP_SERVER  = Path(__file__).parent / "dynatrace_mcp_server.py"
 
-get_logs returns an overall summary AND a per-service breakdown.
-Classify each service independently using these rules:
-  SEV-1: error_rate_pct > 30  OR  avg_response_time_ms > 2000
-  SEV-2: error_rate_pct 15-30 OR  avg_response_time_ms 1000-2000
-  SEV-3: error_rate_pct 5-15  OR  avg_response_time_ms 500-1000
-  SEV-4: error_rate_pct < 5   AND avg_response_time_ms < 500
+CHROMA_PATH = Path(__file__).parent / "chroma_db"
+COLLECTION  = "observability_docs"
+TOP_K       = 3
 
-Steps (no skipping):
-1. Call get_logs once.
-2. For each service in the breakdown:
-   a. Classify its severity using the rules above.
-   b. If SEV-1: call call_on_call_engineer for that service.
-   c. Call raise_alert for that service with its severity.
-3. Call send_email_notification once, summarising all services and their severities.
-4. Call save_metrics once using the overall stats and the highest severity found.
-5. Write a concise incident report covering all services.
+SYSTEM_PROMPT = """You are an expert Observability Agent. You analyse application logs from TWO independent data sources and must correlate them before drawing any conclusions.
+
+━━━ TWO MCP SERVERS, TWO DATA SOURCES ━━━
+You have tools from two separate MCP servers:
+
+  OBS-MCP (Observability MCP — PostgreSQL):
+    get_logs     → returns source="postgresql"  real-time, always authoritative
+
+  DT-MCP (Dynatrace MCP — Dynatrace API):
+    dt_search_logs → returns source="dynatrace"  telemetry pipeline, may lag 30–60 s
+
+Both tools return the SAME per-service schema so you can compare them directly:
+  service              – service name (e.g. "payment-service")
+  total_requests       – request count in the analysis window
+  error_count          – number of 5xx responses
+  error_rate_pct       – percentage of 5xx responses  ← primary correlation field
+  avg_response_time_ms – average latency in milliseconds
+
+CRITICAL RULE: Only use values that appear in the tool responses.
+Do NOT estimate, infer, or invent any metric. If a value is missing, say so.
+
+━━━ HANDLING DT STATUS ━━━
+Check dt_search_logs.status in the response:
+  "ok"               → use the data normally
+  "permission_error" → token missing logs.read scope; note the gap, use PostgreSQL only
+  "not_configured"   → DT env vars not set; note the gap, use PostgreSQL only
+  "error"            → query failed; note the gap, use PostgreSQL only
+
+━━━ CORRELATION RULES ━━━
+For each service, compare error_rate_pct from both sources:
+  Agreement (< 5 pp difference)   → high confidence; proceed with the shared signal
+  DT lower than PostgreSQL        → likely ingestion lag; trust PostgreSQL, note it
+  DT higher than PostgreSQL       → DT captured an earlier burst; use the higher value
+  Large gap (≥ 15 pp difference)  → flag explicitly; use the more alarming value
+
+Always drive severity from the more alarming signal. Quote the actual numbers.
+
+━━━ SEVERITY LEVELS ━━━
+  SEV-1 (CRITICAL) — Service effectively down. Widespread user impact. Immediate intervention required.
+  SEV-2 (HIGH)     — Significant degradation. Meaningful portion of users affected. Prompt attention.
+  SEV-3 (MEDIUM)   — Partial or intermittent degradation. Most users unaffected. Needs investigation.
+  SEV-4 (LOW)      — Minor anomaly. System healthy overall. Monitor.
+
+Weigh holistically — do not apply fixed thresholds:
+  Service criticality — payment/auth affect revenue more than product/health endpoints
+  Error volume        — 30 errors on 31 requests vs 30 errors on 3000
+  Latency             — elevated latency without errors signals resource exhaustion
+  Error type          — 5xx more severe than 4xx; 503 = unavailability
+  Spread              — single service vs cross-service degradation
+
+━━━ STEPS — FOLLOW IN ORDER, NO SKIPPING ━━━
+1. Call get_logs(timeframe_minutes=N)          — fetch PostgreSQL data.
+2. Call dt_search_logs(timeframe_minutes=N)    — fetch Dynatrace data (same window).
+3. Output a CORRELATION SUMMARY in this exact format before taking any action:
+
+   ## CORRELATION SUMMARY
+   Window: <N> minutes | PostgreSQL: <total> reqs | Dynatrace: <total> reqs or "unavailable"
+
+   | Service | PG err% | PG avg_ms | DT err% | DT avg_ms | Δ err% | Resolution |
+   |---------|---------|-----------|---------|-----------|--------|------------|
+   | <name>  | <val>   | <val>     | <val>   | <val>     | <val>  | <agreement/DT-lag/DT-higher/DT-unavailable> |
+
+   Data quality: <one line — note any DT status issues e.g. permission_error, not_configured>
+
+4. Assign a final severity per service.
+   a. SEV-1: call call_on_call_engineer for that service.
+   b. Call raise_alert for every service, every severity level.
+5. Call send_email_notification once — include the full correlation table and reasoning.
+6. Call save_metrics once — use PostgreSQL overall stats as the authoritative counts.
+7. Write the final incident report:
+   — Paste the correlation summary table.
+   — Per-service severity with evidence.
+   — Actions taken (on-call page, alerts, email).
+   — Data quality notes (if DT was unavailable, say so explicitly).
 """
 
 # ---------------------------------------------------------------------------
-# Gemini tool definitions
+# MCP schema → Gemini schema conversion
 # ---------------------------------------------------------------------------
 
-GEMINI_TOOLS = [
-    types.Tool(
-        function_declarations=[
-            types.FunctionDeclaration(
-                name="get_logs",
-                description="Get overall + per-service aggregated stats (error rate, latency) for the last N minutes. Call once at the start.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "timeframe_minutes": types.Schema(
-                            type=types.Type.INTEGER,
-                            description="Minutes to look back. Default 30.",
-                        )
-                    },
-                ),
+_TYPE_MAP = {
+    "string":  types.Type.STRING,
+    "integer": types.Type.INTEGER,
+    "number":  types.Type.NUMBER,
+    "boolean": types.Type.BOOLEAN,
+    "object":  types.Type.OBJECT,
+    "array":   types.Type.ARRAY,
+}
+
+
+def _convert_schema(json_schema: dict) -> types.Schema:
+    """Recursively convert a JSON Schema dict to a Gemini types.Schema."""
+    json_type = json_schema.get("type", "string")
+    kwargs: dict = {"type": _TYPE_MAP.get(json_type, types.Type.STRING)}
+
+    if desc := json_schema.get("description"):
+        kwargs["description"] = desc
+    if json_type == "object" and (props := json_schema.get("properties")):
+        kwargs["properties"] = {k: _convert_schema(v) for k, v in props.items()}
+    if req := json_schema.get("required"):
+        kwargs["required"] = req
+    if json_type == "array" and (items := json_schema.get("items")):
+        kwargs["items"] = _convert_schema(items)
+
+    return types.Schema(**kwargs)
+
+
+def _mcp_tools_to_gemini(mcp_tools) -> list[types.Tool]:
+    """Convert a merged list of MCP tools into Gemini FunctionDeclarations."""
+    declarations = [
+        types.FunctionDeclaration(
+            name=tool.name,
+            description=tool.description or "",
+            parameters=(
+                _convert_schema(tool.inputSchema)
+                if tool.inputSchema
+                else types.Schema(type=types.Type.OBJECT)
             ),
-            types.FunctionDeclaration(
-                name="raise_alert",
-                description="Save a formal alert to the DB. Call for every severity level.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "service": types.Schema(type=types.Type.STRING, description="Affected service name."),
-                        "severity": types.Schema(type=types.Type.INTEGER, description="1=CRITICAL,2=HIGH,3=MEDIUM,4=LOW."),
-                        "message": types.Schema(type=types.Type.STRING, description="Alert description."),
-                    },
-                    required=["service", "severity", "message"],
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="send_email_notification",
-                description="Send a mock email alert. Always call this for every severity.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "recipient": types.Schema(type=types.Type.STRING, description="Recipient email."),
-                        "severity": types.Schema(type=types.Type.INTEGER, description="1-4."),
-                        "subject": types.Schema(type=types.Type.STRING, description="Email subject."),
-                        "body": types.Schema(type=types.Type.STRING, description="Email body with metrics."),
-                    },
-                    required=["recipient", "severity", "subject", "body"],
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="save_metrics",
-                description="Persist analysis metrics to DB. Always call after analysis.",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "window_minutes": types.Schema(type=types.Type.INTEGER, description="Analysis window minutes."),
-                        "total_requests": types.Schema(type=types.Type.INTEGER, description="Total requests."),
-                        "error_count": types.Schema(type=types.Type.INTEGER, description="5xx error count."),
-                        "success_count": types.Schema(type=types.Type.INTEGER, description="2xx count."),
-                        "avg_response_time_ms": types.Schema(type=types.Type.NUMBER, description="Avg latency ms."),
-                        "error_rate": types.Schema(type=types.Type.NUMBER, description="Error rate 0-100."),
-                        "severity_assessment": types.Schema(type=types.Type.INTEGER, description="Severity 1-4."),
-                        "analysis_summary": types.Schema(type=types.Type.STRING, description="Brief summary."),
-                    },
-                    required=[
-                        "window_minutes", "total_requests", "error_count", "success_count",
-                        "avg_response_time_ms", "error_rate", "severity_assessment", "analysis_summary",
-                    ],
-                ),
-            ),
-            types.FunctionDeclaration(
-                name="call_on_call_engineer",
-                description="Page on-call engineer. ONLY for SEV-1 (error_rate > 30% or latency > 2000ms).",
-                parameters=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "service": types.Schema(type=types.Type.STRING, description="Failing service name."),
-                        "message": types.Schema(type=types.Type.STRING, description="Critical failure description with error rate and impact."),
-                    },
-                    required=["service", "message"],
-                ),
-            ),
-        ]
-    )
-]
+        )
+        for tool in mcp_tools
+    ]
+    return [types.Tool(function_declarations=declarations)]
+
 
 # ---------------------------------------------------------------------------
 # Retry helper
@@ -165,142 +197,174 @@ def _parse_retry_delay(err_str: str, default: int = 65) -> int:
     return default
 
 
-def send_with_retry(chat, message, max_retries: int = 8):
-    """Send a chat message, retrying on 429 quota errors with backoff."""
+async def _send_with_retry(chat, message, max_retries: int = 8):
+    """Send a Gemini chat message with backoff on 429 quota errors."""
     for attempt in range(max_retries):
         try:
-            return chat.send_message(message)
+            return await asyncio.to_thread(chat.send_message, message)
         except ClientError as e:
             err = str(e)
-            is_quota = "429" in err or "RESOURCE_EXHAUSTED" in err
-            if is_quota and attempt < max_retries - 1:
+            if ("429" in err or "RESOURCE_EXHAUSTED" in err) and attempt < max_retries - 1:
                 delay = _parse_retry_delay(err)
                 print(f"[Agent] Rate limited – waiting {delay}s (attempt {attempt + 1}/{max_retries})…")
-                time.sleep(delay)
+                await asyncio.sleep(delay)
             else:
                 raise
+
 
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
 
-def run_agent(window_minutes: int = ANALYSIS_WINDOW_MINUTES) -> str:
-    """Run one full analysis cycle. Returns the agent's final incident report."""
-    api_key = GEMINI_API_KEY
-    if not api_key:
-        print("ERROR: GEMINI_API_KEY is not set.")
-        print("  Add it to your .env file or export it as an environment variable.")
+async def _run_agent_async(window_minutes: int) -> str:
+    if not GEMINI_API_KEY:
+        print("ERROR: GEMINI_API_KEY is not set. Add it to your .env file.")
         sys.exit(1)
 
-    client = genai.Client(api_key=api_key)
-
-    chat = client.chats.create(
-        model=MODEL,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            tools=GEMINI_TOOLS,
-        ),
-    )
-
+    client = genai.Client(api_key=GEMINI_API_KEY)
     run_id = str(uuid.uuid4())[:8]
 
-    print(f"\n{'='*70}")
-    print(f"  OBSERVABILITY AGENT  –  Analysing last {window_minutes} minutes")
-    print(f"  Model: {MODEL}  |  Run ID: {run_id}")
-    print(f"{'='*70}\n")
+    obs_params = StdioServerParameters(command=sys.executable, args=[str(OBS_MCP_SERVER)])
+    dt_params  = StdioServerParameters(command=sys.executable, args=[str(DT_MCP_SERVER)])
 
-    log_agent_event(
-        run_id=run_id,
-        event_type="RUN_START",
-        message=f"Agent run started. Analysing last {window_minutes} minutes.",
-    )
+    async with stdio_client(obs_params) as (obs_r, obs_w):
+        async with stdio_client(dt_params) as (dt_r, dt_w):
+            async with ClientSession(obs_r, obs_w) as obs_session:
+                async with ClientSession(dt_r, dt_w) as dt_session:
 
-    user_message = (
-        f"Analyse the application logs from the last {window_minutes} minutes. "
-        "Classify the severity, take appropriate action (on-call page if Sev-1, "
-        "email + alert for all severities), save metrics, and provide a brief "
-        "incident report."
-    )
+                    await obs_session.initialize()
+                    await dt_session.initialize()
 
-    iteration = 0
-    max_iterations = 20
-    final_text = ""
+                    obs_tools = (await obs_session.list_tools()).tools
+                    dt_tools  = (await dt_session.list_tools()).tools
 
-    response = send_with_retry(chat, user_message)
+                    # Merge both tool lists into one Gemini declaration
+                    gemini_tools  = _mcp_tools_to_gemini(obs_tools + dt_tools)
 
-    while iteration < max_iterations:
-        iteration += 1
-        print(f"[Agent] Iteration {iteration}")
+                    # Route each tool call to the correct MCP session
+                    dt_tool_names = {t.name for t in dt_tools}
 
-        function_calls = []
-        for part in response.candidates[0].content.parts:
-            if part.function_call and part.function_call.name:
-                function_calls.append(part.function_call)
-            elif part.text:
-                print(f"\n[Agent Response]\n{part.text}\n")
-                final_text = part.text
+                    def _session_for(name: str) -> ClientSession:
+                        return dt_session if name in dt_tool_names else obs_session
 
-        if not function_calls:
-            print("[Agent] Analysis complete.")
-            break
+                    def _server_label(name: str) -> str:
+                        return "DT-MCP" if name in dt_tool_names else "OBS-MCP"
 
-        tool_response_parts = []
-        for fc in function_calls:
-            tool_name = fc.name
-            tool_args = dict(fc.args)
-
-            print(f"[Tool Call] {tool_name}({json.dumps(tool_args, indent=2)[:300]})")
-
-            log_agent_event(
-                run_id=run_id,
-                event_type="TOOL_CALL",
-                tool_name=tool_name,
-                tool_input=json.dumps(tool_args),
-                message=f"Calling {tool_name}",
-            )
-
-            fn = TOOL_FUNCTIONS.get(tool_name)
-            if fn is None:
-                result = f"Error: unknown tool '{tool_name}'"
-                print(f"[Tool Error] {result}")
-                log_agent_event(run_id=run_id, event_type="TOOL_ERROR",
-                                tool_name=tool_name, tool_result=result, message=result)
-            else:
-                try:
-                    result = fn(**tool_args)
-                    print(f"[Tool Result] {str(result)[:300]}")
-
-                    sev = None
-                    if tool_name == "save_metrics" and "severity_assessment" in tool_args:
-                        sev = int(tool_args["severity_assessment"])
-                    elif tool_name == "call_on_call_engineer":
-                        sev = 1
+                    print(f"\n{'='*70}")
+                    print(f"  OBSERVABILITY AGENT  –  Analysing last {window_minutes} minutes")
+                    print(f"  Model   : {MODEL}  |  Run ID: {run_id}")
+                    print(f"  OBS-MCP : {[t.name for t in obs_tools]}")
+                    print(f"  DT-MCP  : {[t.name for t in dt_tools]}")
+                    print(f"{'='*70}\n")
 
                     log_agent_event(
                         run_id=run_id,
-                        event_type="TOOL_RESULT",
-                        tool_name=tool_name,
-                        tool_result=str(result)[:1000],
-                        severity=sev,
-                        message=f"{tool_name} completed",
+                        event_type="RUN_START",
+                        message=f"Agent run started. Analysing last {window_minutes} minutes.",
                     )
-                except Exception as exc:
-                    result = f"Tool execution error: {exc}"
-                    print(f"[Tool Error] {result}")
-                    log_agent_event(run_id=run_id, event_type="TOOL_ERROR",
-                                    tool_name=tool_name, tool_result=result, message=result)
 
-            tool_response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=tool_name,
-                        response={"result": result},
+                    chat = await asyncio.to_thread(
+                        client.chats.create,
+                        model=MODEL,
+                        config=types.GenerateContentConfig(
+                            system_instruction=SYSTEM_PROMPT,
+                            tools=gemini_tools,
+                        ),
                     )
-                )
-            )
 
-        time.sleep(2)
-        response = send_with_retry(chat, tool_response_parts)
+                    user_message = (
+                        f"Analyse the application logs from the last {window_minutes} minutes. "
+                        "Step 1: call get_logs to fetch PostgreSQL data. "
+                        "Step 2: call dt_search_logs with the same timeframe to fetch Dynatrace data. "
+                        "Step 3: for each service, state the PostgreSQL value, the Dynatrace value, "
+                        "and your correlation reasoning before assigning severity. "
+                        "Do not estimate any metric — only use values present in the tool responses. "
+                        "Then take the appropriate actions (SEV-1 → Slack page, all services → alerts + email), "
+                        "save metrics, and write a concise incident report."
+                    )
+
+                    response = await _send_with_retry(chat, user_message)
+
+                    iteration  = 0
+                    max_iter   = 25
+                    final_text = ""
+
+                    while iteration < max_iter:
+                        iteration += 1
+                        print(f"[Agent] Iteration {iteration}")
+
+                        function_calls = []
+                        for part in response.candidates[0].content.parts:
+                            if part.function_call and part.function_call.name:
+                                function_calls.append(part.function_call)
+                            elif part.text:
+                                print(f"\n[Agent Response]\n{part.text}\n")
+                                final_text = part.text
+
+                        if not function_calls:
+                            print("[Agent] Analysis complete.")
+                            break
+
+                        tool_response_parts = []
+                        for fc in function_calls:
+                            tool_name = fc.name
+                            tool_args = dict(fc.args)
+                            server    = _server_label(tool_name)
+
+                            print(f"[{server} → {tool_name}] {json.dumps(tool_args)[:300]}")
+
+                            log_agent_event(
+                                run_id=run_id,
+                                event_type="TOOL_CALL",
+                                tool_name=tool_name,
+                                tool_input=json.dumps(tool_args),
+                                message=f"Calling {tool_name} via {server}",
+                            )
+
+                            try:
+                                mcp_resp = await _session_for(tool_name).call_tool(
+                                    tool_name, tool_args
+                                )
+                                result = mcp_resp.content[0].text if mcp_resp.content else ""
+                                print(f"[{server} ← {tool_name}] {str(result)[:300]}")
+
+                                sev = None
+                                if tool_name == "save_metrics" and "severity_assessment" in tool_args:
+                                    sev = int(tool_args["severity_assessment"])
+                                elif tool_name == "call_on_call_engineer":
+                                    sev = 1
+
+                                log_agent_event(
+                                    run_id=run_id,
+                                    event_type="TOOL_RESULT",
+                                    tool_name=tool_name,
+                                    tool_result=str(result)[:1000],
+                                    severity=sev,
+                                    message=f"{tool_name} completed",
+                                )
+
+                            except Exception as exc:
+                                result = f"Tool execution error: {exc}"
+                                print(f"[{server} Error] {result}")
+                                log_agent_event(
+                                    run_id=run_id,
+                                    event_type="TOOL_ERROR",
+                                    tool_name=tool_name,
+                                    tool_result=result,
+                                    message=result,
+                                )
+
+                            tool_response_parts.append(
+                                types.Part(
+                                    function_response=types.FunctionResponse(
+                                        name=tool_name,
+                                        response={"result": result},
+                                    )
+                                )
+                            )
+
+                        await asyncio.sleep(2)
+                        response = await _send_with_retry(chat, tool_response_parts)
 
     log_agent_event(
         run_id=run_id,
@@ -315,12 +379,133 @@ def run_agent(window_minutes: int = ANALYSIS_WINDOW_MINUTES) -> str:
     return final_text
 
 
+def run_agent(window_minutes: int = ANALYSIS_WINDOW_MINUTES) -> str:
+    """Synchronous entry point — wraps the async agent loop."""
+    return asyncio.run(_run_agent_async(window_minutes))
+
+
+# ---------------------------------------------------------------------------
+# RAG — retrieval-augmented generation over the runbook knowledge base
+# ---------------------------------------------------------------------------
+
+_RAG_SYSTEM_PROMPT = (
+    "You are a precise assistant for the Observability Agent project. "
+    "Answer the user's question using ONLY the context chunks provided. "
+    "If the answer is not present in the context, say so clearly — do not invent information. "
+    "Be concise. Quote specific details from the context where they are relevant."
+)
+
+
+def _rag_retrieve(question: str) -> list[dict]:
+    """Embed the question and return the top-k closest chunks from ChromaDB."""
+    ef         = embedding_functions.DefaultEmbeddingFunction()
+    chroma     = chromadb.PersistentClient(path=str(CHROMA_PATH))
+    collection = chroma.get_collection(COLLECTION, embedding_function=ef)
+
+    results = collection.query(
+        query_texts=[question],
+        n_results=TOP_K,
+        include=["documents", "metadatas", "distances"],
+    )
+
+    return [
+        {
+            "text":        doc,
+            "source":      meta["source"],
+            "chunk_index": meta["chunk_index"],
+            "distance":    dist,
+        }
+        for doc, meta, dist in zip(
+            results["documents"][0],
+            results["metadatas"][0],
+            results["distances"][0],
+        )
+    ]
+
+
+def _rag_build_prompt(question: str, chunks: list[dict]) -> str:
+    """Combine retrieved chunks into an augmented prompt."""
+    context_blocks = []
+    for i, chunk in enumerate(chunks, 1):
+        context_blocks.append(
+            f"[Context {i} — {chunk['source']}, chunk {chunk['chunk_index']} "
+            f"(cosine distance: {chunk['distance']:.4f})]\n{chunk['text']}"
+        )
+    context = "\n\n---\n\n".join(context_blocks)
+    return f"Context from the observability runbooks:\n\n{context}\n\nQuestion: {question}"
+
+
+def run_rag() -> None:
+    """
+    Interactive RAG loop.
+
+    Flow per question:
+      1. Embed the question using all-MiniLM-L6-v2 (ChromaDB built-in, local)
+      2. Retrieve top-3 closest chunks from the 'observability_docs' collection
+      3. Build an augmented prompt: context chunks + question
+      4. Send to Gemini 2.5 Flash and print the answer
+    """
+    if not GEMINI_API_KEY:
+        print("ERROR: GEMINI_API_KEY is not set in .env")
+        sys.exit(1)
+
+    if not CHROMA_PATH.exists():
+        print("ERROR: chroma_db/ not found — run  python embed_docs.py  first.")
+        sys.exit(1)
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    print(f"\n{'='*70}")
+    print("  OBSERVABILITY RAG ASSISTANT")
+    print("  Knowledge base: dynatrace-alerts | agent-runbook | mcp-integration")
+    print(f"  Model: {MODEL}  |  Top-k: {TOP_K}  |  Type 'exit' to quit")
+    print(f"{'='*70}\n")
+
+    while True:
+        try:
+            question = input("Ask a question: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye.")
+            break
+
+        if not question:
+            continue
+        if question.lower() in ("exit", "quit", "q"):
+            print("Goodbye.")
+            break
+
+        # Step 1 — retrieve
+        print(f"\n[RAG] Retrieving top {TOP_K} chunks...")
+        chunks = _rag_retrieve(question)
+        for i, chunk in enumerate(chunks, 1):
+            print(f"  [{i}] {chunk['source']}  chunk={chunk['chunk_index']}  distance={chunk['distance']:.4f}")
+
+        # Step 2 — build augmented prompt
+        augmented_prompt = _rag_build_prompt(question, chunks)
+
+        # Step 3 — generate answer
+        print("\n[RAG] Generating answer...\n")
+        response = client.models.generate_content(
+            model=MODEL,
+            contents=augmented_prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=_RAG_SYSTEM_PROMPT,
+            ),
+        )
+
+        print(f"Answer:\n{response.text}")
+        print(f"\n{'─'*70}\n")
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    window = int(sys.argv[1]) if len(sys.argv) > 1 else ANALYSIS_WINDOW_MINUTES
-    result = run_agent(window_minutes=window)
-    print("\n--- FINAL INCIDENT REPORT ---")
-    print(result)
+    if "--rag" in sys.argv:
+        run_rag()
+    else:
+        window = int(sys.argv[1]) if len(sys.argv) > 1 else ANALYSIS_WINDOW_MINUTES
+        result = run_agent(window_minutes=window)
+        print("\n--- FINAL INCIDENT REPORT ---")
+        print(result)

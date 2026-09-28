@@ -1,0 +1,39 @@
+DYNATRACE MCP INTEGRATION — HOW IT WORKS AND TOOLS EXPOSED
+============================================================
+
+Architecture
+------------
+dynatrace_mcp_server.py is a standalone MCP server (stdio transport) that runs as a
+subprocess spawned by agent.py at startup. It is entirely separate from the main
+observability MCP server (mcp_server.py). The agent connects to both simultaneously,
+merges their tool lists into a single Gemini function declaration, and routes each
+tool call to the correct server based on tool name.
+
+The server is implemented using the MCP Python SDK (mcp.server.Server) and delegates
+all Dynatrace API calls to dynatrace_client.py.
+
+Tools Exposed
+-------------
+dt_ingest_log
+  Writes a single log entry directly to Dynatrace via the classic Logs Ingest API
+  (POST /api/v2/logs/ingest on live.dynatrace.com). Requires a classic API token
+  (dt0c01.*) with the logs.ingest scope set as DYNATRACE_INGEST_KEY. Intended for
+  manual testing only — automatic log forwarding already happens on every FastAPI
+  request via a fire-and-forget daemon thread in mock_app/database.py.
+
+dt_search_logs
+  Queries aggregated per-service log statistics from Dynatrace Grail using DQL
+  (POST /platform/storage/query/v1/query:execute on apps.dynatrace.com). Uses an
+  OAuth platform token (dt0s16.*) set as DYNATRACE_API_KEY. Returns the identical
+  schema as get_logs — service, total_requests, error_count, error_rate_pct,
+  avg_response_time_ms — tagged with source="dynatrace" so the agent can compare
+  both sources side by side without ambiguity.
+
+Token Split
+-----------
+  DYNATRACE_API_KEY    — OAuth token (dt0s16.*) for DQL reads on apps.dynatrace.com
+  DYNATRACE_INGEST_KEY — Classic token (dt0c01.*) for ingest on live.dynatrace.com
+
+If DYNATRACE_INGEST_KEY is absent, ingest is silently skipped. If DYNATRACE_API_KEY
+is absent, dt_search_logs returns status="not_configured" and the agent falls back
+to PostgreSQL-only analysis.
