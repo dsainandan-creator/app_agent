@@ -111,6 +111,8 @@ def _create_laya_triage(cur):
         )
     """)
     cur.execute("CREATE INDEX IF NOT EXISTS laya_triage_run_id ON laya_triage (run_id)")
+    # Additive: links policy decisions and held pages to their agent run.
+    cur.execute("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS run_id VARCHAR(50)")
 
 
 _laya_table_ready = False
@@ -206,21 +208,50 @@ def fetch_logs(window_minutes: int = 30) -> list[dict]:
         conn.close()
 
 
-def save_alert(severity: int, service: str, message: str, alert_type: str, status: str = "SENT"):
+def save_alert(severity: int, service: str, message: str, alert_type: str,
+               status: str = "SENT", run_id: str = None):
+    if run_id is not None:
+        _ensure_laya_triage()          # also adds alerts.run_id on an older schema
     conn = get_connection()
     try:
         cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO alerts (severity, service, message, alert_type, status)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (severity, service, message, alert_type, status),
-        )
+        if run_id is None:
+            cur.execute(
+                """
+                INSERT INTO alerts (severity, service, message, alert_type, status)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (severity, service, message, alert_type, status),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO alerts (severity, service, message, alert_type, status, run_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                """,
+                (severity, service, message, alert_type, status, run_id),
+            )
         conn.commit()
     except Exception as exc:
         conn.rollback()
         print(f"[DB] Alert save error: {exc}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def fetch_run_alerts(run_id: str, alert_types: tuple) -> list[dict]:
+    """Alerts recorded for one agent run, oldest first."""
+    _ensure_laya_triage()
+    conn = get_connection()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT timestamp, severity, service, message, alert_type, status FROM alerts "
+            "WHERE run_id = %s AND alert_type = ANY(%s) ORDER BY id",
+            (run_id, list(alert_types)),
+        )
+        return [dict(r) for r in cur.fetchall()]
     finally:
         cur.close()
         conn.close()

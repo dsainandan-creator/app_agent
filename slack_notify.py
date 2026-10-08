@@ -13,6 +13,7 @@ even when SLACK_WEBHOOK_URL is set.
 import datetime
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 
@@ -48,13 +49,21 @@ def _log_dry_run(payload: dict, result: dict) -> None:
         print(f"[Slack DRY_RUN] could not write {DRY_RUN_LOG}: {exc}", file=sys.stderr)
 
 
-def notify_slack(service: str, message: str) -> dict:
+def new_incident_id(now: datetime.datetime = None) -> str:
+    """Collision-safe: second, milliseconds and a random suffix, e.g. INC-20261007-211405-123-a3f9c210."""
+    now = now or datetime.datetime.now()
+    return f"INC-{now.strftime('%Y%m%d-%H%M%S')}-{now.microsecond // 1000:03d}-{secrets.token_hex(4)}"
+
+
+def notify_slack(service: str, message: str, context: dict = None) -> dict:
     """
     Post a SEV-1 critical incident alert to Slack via Incoming Webhook.
 
     Args:
         service: The failing service name.
         message: Description of the critical failure (error rate, latency, impact).
+        context: Optional paging-policy context shown in the message:
+                 {"laya_p_sev1": float|None, "gemini_severity": str, "policy": str}.
 
     Returns:
         Dict with incident_id, status ("SENT" or "DRY_RUN"), and delivery details.
@@ -66,7 +75,7 @@ def notify_slack(service: str, message: str) -> dict:
         )
 
     ts = datetime.datetime.now()
-    incident_id = f"INC-{ts.strftime('%Y%m%d-%H%M%S')}"
+    incident_id = new_incident_id(ts)
 
     payload = {
         "blocks": [
@@ -90,6 +99,19 @@ def notify_slack(service: str, message: str) -> dict:
                 "type": "section",
                 "text": {"type": "mrkdwn", "text": f"*Details*\n{message}"},
             },
+        ]
+    }
+    if context:
+        p = context.get("laya_p_sev1")
+        payload["blocks"].append({
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Laya P(sev1)*\n{'unavailable' if p is None else f'{p:.2f}'}"},
+                {"type": "mrkdwn", "text": f"*Gemini severity*\n{context.get('gemini_severity', 'n/a')}"},
+                {"type": "mrkdwn", "text": f"*Paging policy*\n{context.get('policy', 'n/a')}"},
+            ],
+        })
+    payload["blocks"] += [
             {"type": "divider"},
             {
                 "type": "context",
@@ -100,8 +122,7 @@ def notify_slack(service: str, message: str) -> dict:
                     }
                 ],
             },
-        ]
-    }
+    ]
 
     result = {
         "incident_id": incident_id,

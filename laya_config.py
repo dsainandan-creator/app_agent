@@ -38,6 +38,7 @@ DEFAULTS = {
     "LAYA_PAGE_LOW":         "0.40",
     "LAYA_CALIBRATION_FILE": "laya_triage/calibration.json",
     "HARD_FLOOR_ERR_PCT":    "50",
+    "PAGE_MIN_REQUESTS":     "20",
     "CRITICAL_SERVICES":     "payment-service",
 }
 
@@ -65,6 +66,7 @@ class LayaConfig:
     page_low: float
     calibration_file: Path
     hard_floor_err_pct: float
+    page_min_requests: int
     critical_services: tuple
 
     @property
@@ -108,6 +110,7 @@ def load_config(env=None) -> LayaConfig:
         page_low=float(_get(env, "LAYA_PAGE_LOW")),
         calibration_file=calibration,
         hard_floor_err_pct=float(_get(env, "HARD_FLOOR_ERR_PCT")),
+        page_min_requests=int(_get(env, "PAGE_MIN_REQUESTS")),
         critical_services=tuple(
             s.strip() for s in _get(env, "CRITICAL_SERVICES").split(",") if s.strip()
         ),
@@ -126,6 +129,8 @@ def _validate(cfg: LayaConfig) -> None:
         raise ValueError(
             f"need 0 <= LAYA_PAGE_LOW ({cfg.page_low}) <= LAYA_PAGE_HIGH ({cfg.page_high}) <= 1"
         )
+    if cfg.page_min_requests < 0:
+        raise ValueError(f"PAGE_MIN_REQUESTS must be >= 0, got {cfg.page_min_requests}")
     if cfg.timeout_s <= 0:
         raise ValueError(f"LAYA_TIMEOUT_S must be positive, got {cfg.timeout_s}")
 

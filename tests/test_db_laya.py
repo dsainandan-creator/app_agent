@@ -47,3 +47,15 @@ def test_save_and_fetch_round_trip(test_db):
     assert rows["payment-service"]["answers"]["laya"]["p"]["sev1"] == 0.9
     assert rows["api-gateway"]["answers"]["status"] == "unavailable"
     assert rows["payment-service"]["mode"] == "shadow"
+
+
+def test_alerts_run_id_and_fetch_run_alerts(test_db):
+    import uuid
+    db.init_db()
+    run_id = "test-" + uuid.uuid4().hex[:8]
+    db.save_alert(2, "order-service", "held", "PAGE_HELD", status="HELD", run_id=run_id)
+    db.save_alert(None, "order-service", "decision", "POLICY_SHADOW", status="PAGE_HELD", run_id=run_id)
+    db.save_alert(4, "api-gateway", "no run id", "RAISE_ALERT")        # old call shape still works
+    rows = db.fetch_run_alerts(run_id, ("PAGE_HELD", "POLICY_SHADOW"))
+    assert [(r["alert_type"], r["status"]) for r in rows] == [("PAGE_HELD", "HELD"), ("POLICY_SHADOW", "PAGE_HELD")]
+    assert db.fetch_run_alerts(run_id, ("PAGE_HELD",))[0]["severity"] == 2

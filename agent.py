@@ -50,7 +50,7 @@ from laya_triage.prompting import (
     unavailable_triage,
 )
 from dynatrace_client import dt_ingest_tool_dry_run
-from mock_app.database import log_agent_event, save_laya_triage
+from mock_app.database import fetch_run_alerts, log_agent_event, save_laya_triage
 from slack_notify import slack_mode
 
 load_dotenv()
@@ -328,6 +328,57 @@ async def _laya_pretriage(run_id, window_minutes, obs_session, dt_session, laya_
     return pg, dt, packs, triage
 
 
+def _apply_policy_after_loop(run_id: str, mode: str, packs: list,
+                             paged_by_gemini: set, gemini_severity: dict) -> str:
+    """
+    After the Gemini loop: decide for every service Gemini did not page (NO_PAGE or
+    PAGE_FORCED), send forced pages in enforce mode, then return the decision table
+    for this run (the tool already recorded decisions for services Gemini paged).
+    """
+    import tools as obs_tools
+    from policy import PAGE_FORCED
+
+    for pack in packs:
+        service = pack["service"]
+        if service in paged_by_gemini:
+            continue
+        ctx = obs_tools.policy_context(run_id, service)
+        if ctx is None:
+            continue
+        decision = ctx["decide"](gemini_pages=False)
+        obs_tools.record_decision(run_id, service, decision, mode)
+        if mode == "enforce" and decision.outcome == PAGE_FORCED:
+            incident = obs_tools.send_forced_page(
+                run_id, service, decision, gemini_severity.get(service, "not assessed"))
+            print(f"[Policy] PAGE_FORCED {service}: {incident['status']} {incident['incident_id']}")
+            log_agent_event(
+                run_id=run_id,
+                event_type="POLICY_PAGE_FORCED",
+                tool_name="call_on_call_engineer",
+                tool_input=json.dumps({"service": service, "decision": decision.to_dict()}),
+                tool_result=json.dumps(incident)[:1000],
+                severity=1,
+                message=f"Paging policy forced a page for {service}; Gemini did not page",
+            )
+
+    rows = fetch_run_alerts(run_id, obs_tools.POLICY_ALERT_TYPES)
+    if not rows:
+        return ""
+    enforced = mode == "enforce"
+    lines = [
+        f"## Paging policy decisions (mode: {mode}"
+        + ("" if enforced else " — recorded only, not enforced") + ")",
+        "",
+        "| Service | Gemini SEV | Decision | Detail |",
+        "|---------|------------|----------|--------|",
+    ]
+    for r in rows:
+        detail = r["message"].split("] ", 1)[-1].replace("|", "/")
+        lines.append(f"| {r['service']} | {gemini_severity.get(r['service'], 'n/a')} "
+                     f"| {r['status']} | {detail} |")
+    return "\n".join(lines)
+
+
 async def _run_agent_async(window_minutes: int) -> str:
     if not GEMINI_API_KEY:
         print("ERROR: GEMINI_API_KEY is not set. Add it to your .env file.")
@@ -404,6 +455,10 @@ async def _run_agent_async(window_minutes: int) -> str:
             "save metrics, and write a concise incident report."
         )
 
+        packs: list = []
+        paged_by_gemini: set = set()
+        gemini_severity: dict = {}
+
         if laya_cfg.enabled:
             pg, dt, packs, triage = await _laya_pretriage(
                 run_id, window_minutes, obs_session, dt_session, laya_session,
@@ -472,6 +527,14 @@ async def _run_agent_async(window_minutes: int) -> str:
                     result = mcp_resp.content[0].text if mcp_resp.content else ""
                     print(f"[{server} ← {tool_name}] {str(result)[:300]}")
 
+                    if tool_name == "call_on_call_engineer":
+                        paged_by_gemini.add(tool_args.get("service"))
+                    elif tool_name == "raise_alert" and not getattr(mcp_resp, "isError", False):
+                        try:
+                            gemini_severity[tool_args.get("service")] = f"SEV-{int(tool_args['severity'])}"
+                        except (KeyError, TypeError, ValueError):
+                            pass
+
                     sev = None
                     if tool_name == "save_metrics" and "severity_assessment" in tool_args:
                         sev = int(tool_args["severity_assessment"])
@@ -509,6 +572,15 @@ async def _run_agent_async(window_minutes: int) -> str:
 
             await asyncio.sleep(2)
             response = await _send_with_retry(chat, tool_response_parts)
+
+    if laya_cfg.enabled and packs:
+        policy_table = _apply_policy_after_loop(
+            run_id, laya_mode, packs, paged_by_gemini, gemini_severity)
+        if policy_table:
+            print(f"\n{policy_table}\n")
+            # Shadow mode leaves the report unchanged; advisory/enforce append the decisions.
+            if laya_mode in ("advisory", "enforce"):
+                final_text = f"{final_text}\n\n{policy_table}" if final_text else policy_table
 
     log_agent_event(
         run_id=run_id,
