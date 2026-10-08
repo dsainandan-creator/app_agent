@@ -176,6 +176,7 @@ def raise_alert(service: str, severity: int, message: str, run_id: str = None) -
         service=service,
         message=message,
         alert_type="RAISE_ALERT",
+        run_id=run_id,
     )
 
     banner = (
@@ -329,6 +330,11 @@ def call_on_call_engineer(service: str, message: str, run_id: str = None) -> str
         incident = _send_page(service, message, alert_note=note, run_id=run_id,
                               context=slack_context)
         incident["policy"] = {**decision.to_dict(), "mode": mode, "enforced": mode == "enforce"}
+        if mode == "advisory":
+            incident["policy_note"] = (
+                f"Advisory only: this page WAS sent. In enforce mode the paging policy would "
+                f"have decided {decision.outcome} ({decision.reason}). Report it as "
+                f"'page sent; policy would {decision.outcome}', not as held or forced.")
         return json.dumps(incident)
 
     # enforce + PAGE_HELD: no Slack page

@@ -27,8 +27,11 @@ Use this correlation table format instead of the one in step 3 (two extra column
    |---------|---------|-----------|---------|-----------|--------|------------|--------------|-----------|
 
 Paging: call call_on_call_engineer only for services you assess as SEV-1, exactly as before.
-A deterministic paging policy in code makes the final decision; its outcome comes back in the
-tool result. Report that outcome as-is in the final report.
+A deterministic paging policy in code also decides; its outcome comes back in the tool result.
+  - If the result has "enforced": true, that outcome is what happened (e.g. PAGE_HELD means no
+    page was sent). Report it as-is.
+  - If it has "enforced": false (advisory mode), the page WAS sent and the outcome is only what
+    the policy would have done. Say "page sent; policy would <outcome>", never "held".
 """
 
 

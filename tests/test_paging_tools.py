@@ -72,6 +72,7 @@ def test_advisory_records_decision_pages_and_shows_it(env):
     assert "POLICY_SHADOW" in types_of(env) and "PAGE_HELD" not in types_of(env)
     oncall = next(a for a in env["alerts"] if a["alert_type"] == "ONCALL")
     assert "not enforced" in oncall["message"]
+    assert "this page WAS sent" in out["policy_note"]
 
 
 def test_enforce_holds_the_page(env):

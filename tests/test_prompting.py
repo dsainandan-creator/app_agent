@@ -38,7 +38,8 @@ def test_advisory_message_carries_data_and_columns():
 def test_addendum_has_the_rules():
     a = prompting.LAYA_PROMPT_ADDENDUM
     for needle in ("calibrated prior", "Confirm Laya's verdict or override it",
-                   "Quote Laya's probabilities", "Laya SEV (p)", "Agent SEV", "unavailable"):
+                   "Quote Laya's probabilities", "Laya SEV (p)", "Agent SEV", "unavailable",
+                   '"enforced": false', "page sent; policy would"):
         assert needle in a
 
 

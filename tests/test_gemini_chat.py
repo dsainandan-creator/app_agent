@@ -113,3 +113,24 @@ def test_daemon_thread_does_not_block_exit():
         agent._call_with_deadline(lambda: time.sleep(5), 0.01)
     stuck = [t for t in threading.enumerate() if t.name == "gemini-call"]
     assert stuck and all(t.daemon for t in stuck)
+
+
+def test_empty_response_is_retried_and_not_recorded(monkeypatch):
+    async def no_sleep(s):
+        pass
+    monkeypatch.setattr(agent.asyncio, "sleep", no_sleep)
+
+    class Models:
+        calls = 0
+        def generate_content(self, model, contents, config):
+            Models.calls += 1
+            if Models.calls == 1:
+                return types.GenerateContentResponse(candidates=[types.Candidate(
+                    content=types.Content(role="model", parts=None), finish_reason="STOP")])
+            return _response("real answer")
+
+    client = type("C", (), {"models": Models()})()
+    chat = agent._BoundedChat(client, "m", None)
+    resp = asyncio.run(agent._send_with_retry(chat, "q"))
+    assert resp.candidates[0].content.parts[0].text == "real answer"
+    assert Models.calls == 2 and [c.parts[0].text for c in chat.history] == ["q", "real answer"]

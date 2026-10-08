@@ -251,8 +251,12 @@ class _BoundedChat:
                 model=self.model, contents=contents, config=self.config),
             timeout_s,
         )
-        if response.candidates and response.candidates[0].content:
-            self.history = contents + [response.candidates[0].content]
+        candidate = response.candidates[0] if response.candidates else None
+        if not (candidate and candidate.content and candidate.content.parts):
+            # Seen intermittently: a candidate with no parts. Nothing to act on; retry.
+            reason = getattr(candidate, "finish_reason", None) if candidate else "no candidates"
+            raise EmptyGeminiResponse(f"Gemini returned an empty response (finish_reason={reason})")
+        self.history = contents + [candidate.content]
         return response
 
 
@@ -278,10 +282,14 @@ def _call_with_deadline(fn, timeout_s: float):
     return box["result"]
 
 
+class EmptyGeminiResponse(RuntimeError):
+    """A response with no content parts; treated as transient."""
+
+
 def _is_transient(exc: BaseException) -> bool:
     import requests
-    return isinstance(exc, (TimeoutError, ConnectionError, requests.exceptions.ConnectionError,
-                            requests.exceptions.Timeout))
+    return isinstance(exc, (TimeoutError, ConnectionError, EmptyGeminiResponse,
+                            requests.exceptions.ConnectionError, requests.exceptions.Timeout))
 
 
 async def _send_with_retry(chat, message, max_retries: int = 8):
