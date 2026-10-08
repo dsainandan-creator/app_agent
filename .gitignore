@@ -7,3 +7,9 @@ __pycache__/
 node_modules/
 .DS_Store
 *.log
+.claude/
+# local screenshots
+Screenshot *.png
+logs/
+laya_triage/training/data/
+laya_triage/training/out/

@@ -1,0 +1,115 @@
+{
+  "version": 1,
+  "_comment": "Band thresholds, the text Laya sees, token budgets and question definitions. Bands: a value goes in the first level whose 'below' it is under; 'below': null is the open top level.",
+
+  "bands": {
+    "server_error_rate": {
+      "field": "error_rate_pct",
+      "levels": [
+        {"label": "none",     "below": 1,    "text": "none (under 1% of requests fail with 5xx)"},
+        {"label": "low",      "below": 5,    "text": "low (1-5% of requests fail with 5xx)"},
+        {"label": "moderate", "below": 15,   "text": "moderate (5-15% of requests fail with 5xx)"},
+        {"label": "high",     "below": 30,   "text": "high (15-30% of requests fail with 5xx)"},
+        {"label": "severe",   "below": null, "text": "severe (30% or more of requests fail with 5xx)"}
+      ]
+    },
+    "latency": {
+      "field": "avg_response_time_ms",
+      "levels": [
+        {"label": "normal",   "below": 300,  "text": "normal (average under 300 ms)"},
+        {"label": "elevated", "below": 1000, "text": "elevated (average 300 ms to 1 s)"},
+        {"label": "high",     "below": 2000, "text": "high (average 1-2 s)"},
+        {"label": "severe",   "below": null, "text": "severe (average 2 s or more)"}
+      ]
+    },
+    "request_volume": {
+      "field": "total_requests",
+      "levels": [
+        {"label": "very_low", "below": 20,   "text": "very low (under 20 requests in the window; rates are noisy)"},
+        {"label": "low",      "below": 100,  "text": "low (20-100 requests in the window)"},
+        {"label": "normal",   "below": 1000, "text": "normal (100-1,000 requests in the window)"},
+        {"label": "high",     "below": null, "text": "high (1,000 or more requests in the window)"}
+      ]
+    },
+    "client_error_rate": {
+      "field": "client_error_rate_pct",
+      "levels": [
+        {"label": "none",     "below": 1,    "text": "none (under 1% of requests get 4xx)"},
+        {"label": "low",      "below": 5,    "text": "low (1-5% of requests get 4xx)"},
+        {"label": "moderate", "below": 15,   "text": "moderate (5-15% of requests get 4xx)"},
+        {"label": "high",     "below": 30,   "text": "high (15-30% of requests get 4xx)"},
+        {"label": "severe",   "below": null, "text": "severe (30% or more of requests get 4xx)"}
+      ]
+    }
+  },
+
+  "resolution": {
+    "agreement_below_pp": 5,
+    "large_gap_pp": 15,
+    "text": {
+      "agreement": "Dynatrace agrees with PostgreSQL",
+      "DT-lag": "Dynatrace shows fewer errors than PostgreSQL (likely ingestion lag)",
+      "DT-higher": "Dynatrace shows more errors than PostgreSQL",
+      "DT-unavailable": "Dynatrace data unavailable; PostgreSQL only"
+    },
+    "large_gap_text": "; the gap between the sources is large (15 or more percentage points)"
+  },
+
+  "criticality_text": {
+    "critical": "critical (revenue or authentication path)",
+    "standard": "standard"
+  },
+
+  "max_error_samples": 5,
+  "max_sample_chars": 160,
+
+  "token_budget": {
+    "max_len": {"english": 512, "multilingual": 1024, "typed-decisions": 1024},
+    "head_reserve_tokens": 272,
+    "chars_per_token_estimate": 3.0
+  },
+
+  "questions": {
+    "severity": {
+      "type": "choice",
+      "instructions": "What is the incident severity of this service right now?",
+      "criteria": {
+        "sev1": "SEV-1 critical: the service is effectively down, with widespread user impact; it needs immediate action",
+        "sev2": "SEV-2 high: significant degradation with meaningful user impact; it needs a prompt response",
+        "sev3": "SEV-3 medium: partial or intermittent issues, most users unaffected; it needs investigation",
+        "sev4": "SEV-4 low: a minor anomaly, the system is healthy overall; keep monitoring"
+      }
+    },
+    "user_impact": {
+      "type": "choice",
+      "instructions": "How many users of this service are affected?",
+      "criteria": {
+        "widespread": "most users are affected",
+        "partial": "a meaningful minority of users are affected, intermittently or on some paths",
+        "minimal": "few or no users notice anything"
+      }
+    },
+    "failure_mode": {
+      "type": "choice",
+      "instructions": "What is the most likely failure mode, based on the recent errors?",
+      "criteria": {
+        "db_pool": "database connection pool exhaustion or database connection failures",
+        "upstream_timeout": "timeouts or unavailability of an upstream or dependent service",
+        "payment_gateway": "the external payment provider or gateway is failing",
+        "auth": "authentication, authorization or token failures",
+        "resource_exhaustion": "the service itself is out of CPU, memory, threads or disk",
+        "other": "something else, or no clear failure"
+      }
+    },
+    "page_now": {
+      "type": "choice",
+      "instructions": "Should an on-call engineer be woken up right now for this service?",
+      "criteria": {
+        "A": "yes, wake an on-call engineer now; this cannot wait until working hours",
+        "B": "no, record an alert and let the team handle it during working hours"
+      }
+    }
+  },
+
+  "page_now_labels": {"A": "yes", "B": "no"}
+}

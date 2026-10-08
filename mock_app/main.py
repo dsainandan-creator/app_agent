@@ -65,10 +65,10 @@ async def logging_middleware(request: Request, call_next):
 
     if status >= 500:
         msg = f"[{method}] {endpoint} → {status} Internal Server Error"
-        err = "Unhandled exception in service layer"
+        err = failure_detail(endpoint, status)
     elif status >= 400:
         msg = f"[{method}] {endpoint} → {status} Client Error"
-        err = "Bad request or resource not found"
+        err = failure_detail(endpoint, status)
     else:
         msg = f"[{method}] {endpoint} → {status} OK  ({elapsed_ms:.1f} ms)"
         err = None
@@ -84,6 +84,61 @@ async def logging_middleware(request: Request, call_next):
     )
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Failure-specific error details
+# ---------------------------------------------------------------------------
+
+# Each area fails in its own characteristic ways, so error_detail says *why* a
+# request failed (Laya's failure_mode question reads these). Keyed by path prefix.
+_SERVER_ERRORS = {
+    "/api/payments": {
+        502: ["Payment provider returned 502 Bad Gateway",
+              "Card processor unavailable (HTTP 502 from gateway)"],
+        503: ["Connection to payment provider timed out after 3 s",
+              "Payment gateway circuit breaker OPEN"],
+        500: ["Database connection pool exhausted - all threads blocked",
+              "Timeout acquiring connection from pool after 5000 ms"],
+    },
+    "/api/orders": {
+        503: ["Upstream inventory-service timed out after 3000 ms",
+              "504 Gateway Timeout from upstream shipping-api"],
+        500: ["Database connection pool exhausted - all threads blocked",
+              "psycopg2.OperationalError: too many connections for role 'app'"],
+    },
+    "/api/users": {
+        500: ["OAuth token introspection endpoint unreachable",
+              "Session store lookup failed: Redis connection refused",
+              "Timeout acquiring connection from pool after 5000 ms"],
+    },
+    "/api/products": {
+        500: ["Thread pool exhausted: 200/200 workers busy",
+              "Product cache rebuild failed: java.lang.OutOfMemoryError"],
+    },
+    "/api/inventory": {
+        503: ["Upstream warehouse-api timed out after 2000 ms"],
+        500: ["Database connection pool exhausted - all threads blocked",
+              "Thread pool exhausted: 200/200 workers busy"],
+    },
+}
+_CLIENT_ERRORS = {
+    400: "Invalid request payload: missing required field 'items'",
+    401: "Missing or expired bearer token",
+    404: "Resource not found",
+    422: "Card validation failed: expiry date in the past",
+}
+
+
+def failure_detail(endpoint: str, status: int) -> str:
+    """A realistic error_detail for a failed request on this endpoint."""
+    if status < 500:
+        return _CLIENT_ERRORS.get(status, f"Client error {status}")
+    for prefix, by_status in _SERVER_ERRORS.items():
+        if endpoint.startswith(prefix):
+            options = by_status.get(status) or by_status.get(500) or next(iter(by_status.values()))
+            return random.choice(options)
+    return f"Unhandled {status} in {endpoint}"
 
 
 # ---------------------------------------------------------------------------

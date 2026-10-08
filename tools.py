@@ -8,14 +8,22 @@ Tools available to the agent:
   3. send_email_notification  – mock email sender
   4. save_metrics             – save analysis metrics to DB
   5. call_on_call_engineer    – escalate Sev-1 via Slack Incoming Webhook
+
+When the agent passes this run's run_id (LAYA_ENABLED=true), call_on_call_engineer
+runs the paging policy (policy.py) against the run's Laya triage, and
+send_email_notification lists held pages. Without a run_id they behave as before.
 """
 
 import datetime
 import json
 from typing import Any
 
+import policy
+from laya_config import load_config as load_laya_config
 from mock_app.database import (
+    fetch_laya_triage,
     fetch_logs,
+    fetch_run_alerts,
     save_alert,
     save_metrics_record,
 )
@@ -41,16 +49,32 @@ def _infer_service(endpoint: str) -> str:
     return "api-gateway"
 
 
+MAX_ERROR_SAMPLES = 5
+
+
 def get_logs(timeframe_minutes: int = 30) -> str:
     """
     Retrieve aggregated log statistics from the last N minutes.
     Returns overall stats plus a per-service breakdown — no raw rows.
     """
     rows = fetch_logs(window_minutes=timeframe_minutes)
+    return json.dumps(summarize_logs(rows, timeframe_minutes), default=str)
 
+
+def summarize_logs(rows: list[dict], timeframe_minutes: int) -> dict:
+    """
+    Aggregate log rows (newest first, as fetch_logs returns them) into the
+    get_logs payload. Pure, so it can be tested without a database.
+
+    Fields added for Laya triage (additive; the original fields are unchanged):
+      overall/services: client_error_count, client_error_rate_pct (4xx)
+      services:         error_samples – up to 5 distinct error_detail texts from
+                        the most recent 5xx rows
+    """
     total = len(rows)
     errors = [r for r in rows if r.get("status_code", 0) >= 500]
     successes = [r for r in rows if r.get("status_code", 0) < 400]
+    client_errors = [r for r in rows if 400 <= r.get("status_code", 0) < 500]
 
     overall_error_rate = (len(errors) / total * 100) if total else 0.0
     overall_avg_rt = (
@@ -60,19 +84,29 @@ def get_logs(timeframe_minutes: int = 30) -> str:
 
     # Per-service aggregation
     from collections import defaultdict
-    svc_buckets: dict = defaultdict(lambda: {"total": 0, "errors": 0, "latencies": []})
+    svc_buckets: dict = defaultdict(
+        lambda: {"total": 0, "errors": 0, "client_errors": 0, "latencies": [], "samples": []}
+    )
     for r in rows:
         svc = _infer_service(r.get("endpoint", ""))
-        svc_buckets[svc]["total"] += 1
+        b = svc_buckets[svc]
+        b["total"] += 1
         if r.get("response_time_ms"):
-            svc_buckets[svc]["latencies"].append(r["response_time_ms"])
-        if r.get("status_code", 0) >= 500:
-            svc_buckets[svc]["errors"] += 1
+            b["latencies"].append(r["response_time_ms"])
+        status = r.get("status_code", 0)
+        if status >= 500:
+            b["errors"] += 1
+            detail = (r.get("error_detail") or "").strip()
+            if detail and detail not in b["samples"] and len(b["samples"]) < MAX_ERROR_SAMPLES:
+                b["samples"].append(detail)
+        elif status >= 400:
+            b["client_errors"] += 1
 
     services = []
     for svc, b in sorted(svc_buckets.items()):
         t = b["total"]
         e = b["errors"]
+        c = b["client_errors"]
         avg = sum(b["latencies"]) / len(b["latencies"]) if b["latencies"] else 0.0
         services.append({
             "service": svc,
@@ -80,9 +114,12 @@ def get_logs(timeframe_minutes: int = 30) -> str:
             "error_count": e,
             "error_rate_pct": round(e / t * 100, 1) if t else 0.0,
             "avg_response_time_ms": round(avg, 1),
+            "client_error_count": c,
+            "client_error_rate_pct": round(c / t * 100, 1) if t else 0.0,
+            "error_samples": b["samples"],
         })
 
-    result = {
+    return {
         "source": "postgresql",
         "status": "ok",
         "window_minutes": timeframe_minutes,
@@ -92,10 +129,11 @@ def get_logs(timeframe_minutes: int = 30) -> str:
             "success_count": len(successes),
             "error_rate_pct": round(overall_error_rate, 1),
             "avg_response_time_ms": round(overall_avg_rt, 1),
+            "client_error_count": len(client_errors),
+            "client_error_rate_pct": round(len(client_errors) / total * 100, 1) if total else 0.0,
         },
         "services": services,
     }
-    return json.dumps(result, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +141,21 @@ def get_logs(timeframe_minutes: int = 30) -> str:
 # ---------------------------------------------------------------------------
 
 
-def raise_alert(service: str, severity: int, message: str) -> str:
+def validate_severity(severity) -> int:
+    """Severity must be a whole number 1-4 (Gemini may send 2.0). Anything else is rejected
+    with an error the model sees in the tool result."""
+    ok = (not isinstance(severity, bool) and isinstance(severity, (int, float))
+          and float(severity).is_integer() and 1 <= int(severity) <= 4)
+    if not ok:
+        raise ValueError(
+            f"raise_alert rejected: severity must be an integer from 1 to 4 "
+            f"(1=CRITICAL, 2=HIGH, 3=MEDIUM, 4=LOW), got {severity!r}. "
+            "Nothing was recorded; call raise_alert again with a valid severity."
+        )
+    return int(severity)
+
+
+def raise_alert(service: str, severity: int, message: str, run_id: str = None) -> str:
     """
     Persist an alert record in the alerts table and print it.
 
@@ -115,14 +167,16 @@ def raise_alert(service: str, severity: int, message: str) -> str:
     Returns:
         Confirmation string.
     """
+    severity = validate_severity(severity)
     level_labels = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
-    label = level_labels.get(severity, "UNKNOWN")
+    label = level_labels[severity]
 
     save_alert(
         severity=severity,
         service=service,
         message=message,
         alert_type="RAISE_ALERT",
+        run_id=run_id,
     )
 
     banner = (
@@ -144,6 +198,7 @@ def send_email_notification(
     severity: int,
     subject: str,
     body: str,
+    run_id: str = None,
 ) -> str:
     """
     Send a mock email alert. Prints to console and persists to DB.
@@ -160,6 +215,10 @@ def send_email_notification(
     level_labels = {1: "CRITICAL", 2: "HIGH", 3: "MEDIUM", 4: "LOW"}
     label = level_labels.get(severity, "UNKNOWN")
     ts = datetime.datetime.now().isoformat(timespec="seconds")
+
+    held = held_pages_section(run_id)
+    if held:
+        body = f"{body}\n\n{held}"
 
     # Persist in alerts table as EMAIL type
     save_alert(
@@ -233,28 +292,164 @@ def save_metrics(
 # Tool 6 – Call on-call engineer
 # ---------------------------------------------------------------------------
 
-def call_on_call_engineer(service: str, message: str) -> str:
+def call_on_call_engineer(service: str, message: str, run_id: str = None) -> str:
     """
     Escalate a Sev-1 critical incident via Slack Incoming Webhook.
     Also persists the escalation in the alerts DB.
 
+    With a run_id that has Laya triage, the paging policy decides first:
+      shadow / advisory – the decision is recorded (POLICY_SHADOW); the page goes out as before
+      enforce           – the decision is applied: PAGE sends, PAGE_HELD records a SEV-2
+                          "held page, needs human review" alert and sends nothing
+
     Args:
         service: The failing service or component.
         message: Description of the critical failure.
+        run_id:  Injected by the agent; never supplied by Gemini.
 
     Returns:
-        Incident details as a JSON string.
+        Incident details (or the held-page notice) as a JSON string.
     """
-    incident = notify_slack(service=service, message=message)
+    ctx = policy_context(run_id, service)
+    if ctx is None:                               # no Laya triage for this run: as before
+        return json.dumps(_send_page(service, message, alert_note=None, run_id=None))
 
+    decision = ctx["decide"](gemini_pages=True)
+    mode = ctx["mode"]
+    record_decision(run_id, service, decision, mode)
+
+    if mode == "shadow":                          # actual behaviour unchanged
+        return json.dumps(_send_page(service, message, alert_note=None, run_id=run_id))
+
+    slack_context = {"laya_p_sev1": decision.laya_p_sev1,
+                     "gemini_severity": "SEV-1 (called page)",
+                     "policy": decision.summary()}
+    if mode == "advisory" or decision.sends_page:
+        note = (f"policy advisory: {decision.outcome} (not enforced)" if mode == "advisory"
+                else decision.outcome)
+        incident = _send_page(service, message, alert_note=note, run_id=run_id,
+                              context=slack_context)
+        incident["policy"] = {**decision.to_dict(), "mode": mode, "enforced": mode == "enforce"}
+        if mode == "advisory":
+            incident["policy_note"] = (
+                f"Advisory only: this page WAS sent. In enforce mode the paging policy would "
+                f"have decided {decision.outcome} ({decision.reason}). Report it as "
+                f"'page sent; policy would {decision.outcome}', not as held or forced.")
+        return json.dumps(incident)
+
+    # enforce + PAGE_HELD: no Slack page
+    save_alert(
+        severity=2,
+        service=service,
+        message=f"[PAGE_HELD] held page, needs human review. {decision.reason}. Gemini: {message}",
+        alert_type="PAGE_HELD",
+        status="HELD",
+        run_id=run_id,
+    )
+    return json.dumps({
+        "status": "PAGE_HELD",
+        "service": service,
+        "policy": {**decision.to_dict(), "mode": mode, "enforced": True},
+        "note": ("No Slack page was sent. The paging policy held this page. Report this "
+                 "service as SEV-2 'held page, needs human review' and include it in the email."),
+    })
+
+
+def _send_page(service: str, message: str, alert_note, run_id, context: dict = None) -> dict:
+    incident = notify_slack(service=service, message=message, context=context)
+    note = f" [{alert_note}]" if alert_note else ""
     save_alert(
         severity=1,
         service=service,
-        message=f"[SLACK] {incident['incident_id']}: {message}",
+        message=f"[SLACK {incident['status']}]{note} {incident['incident_id']}: {message}",
         alert_type="ONCALL",
+        status=incident["status"],
+        run_id=run_id,
+    )
+    return incident
+
+
+# ---------------------------------------------------------------------------
+# Paging policy plumbing (used by call_on_call_engineer and by agent.py after
+# the Gemini loop for services Gemini did not page)
+# ---------------------------------------------------------------------------
+
+POLICY_ALERT_TYPES = ("POLICY_SHADOW", "POLICY_ENFORCED")
+
+
+def policy_context(run_id: str, service: str):
+    """
+    Everything the policy needs for one service of one run, or None when the run
+    has no Laya triage (Laya disabled), in which case paging behaves as before.
+    """
+    if not run_id:
+        return None
+    try:
+        rows = fetch_laya_triage(run_id)
+    except Exception as exc:   # noqa: BLE001 – policy plumbing must not break paging
+        print(f"[Policy] could not read laya_triage for run {run_id}: {exc}")
+        return None
+    if not rows:
+        return None
+    cfg = load_laya_config()
+    mode = next(iter(rows.values()))["mode"]
+    row = rows.get(service)
+
+    if row is None:
+        # Gemini named a service that was not triaged (e.g. a typo): no evidence to judge.
+        def decide(gemini_pages: bool):
+            return policy.Decision(
+                policy.PAGE if gemini_pages else policy.NO_PAGE,
+                "service not in this run's Laya triage", "unknown_service",
+                gemini_pages, None, False, False)
+        return {"mode": mode, "decide": decide, "cfg": cfg}
+
+    answers = row["answers"] or {}
+    laya = answers.get("laya") if answers.get("status") == "ok" else None
+    pack = row["evidence"]
+    return {"mode": mode, "cfg": cfg, "pack": pack, "laya": laya,
+            "decide": lambda gemini_pages: policy.decide(gemini_pages, laya, pack, cfg)}
+
+
+def record_decision(run_id: str, service: str, decision, mode: str) -> None:
+    """One alerts row per service per run with the policy decision."""
+    alert_type = "POLICY_ENFORCED" if mode == "enforce" else "POLICY_SHADOW"
+    severity = 1 if decision.sends_page else (2 if decision.outcome == policy.PAGE_HELD else None)
+    save_alert(
+        severity=severity,
+        service=service,
+        message=f"[{mode}] {decision.summary()}",
+        alert_type=alert_type,
+        status=decision.outcome,
+        run_id=run_id,
     )
 
-    return json.dumps(incident)
+
+def send_forced_page(run_id: str, service: str, decision, gemini_severity: str) -> dict:
+    """PAGE_FORCED (enforce mode): page a service Gemini did not page."""
+    message = (f"PAGE_FORCED by the paging policy: Gemini did not page this service "
+               f"(Gemini severity: {gemini_severity}). {decision.reason}.")
+    return _send_page(
+        service, message, alert_note="PAGE_FORCED", run_id=run_id,
+        context={"laya_p_sev1": decision.laya_p_sev1, "gemini_severity": gemini_severity,
+                 "policy": decision.summary()},
+    )
+
+
+def held_pages_section(run_id: str) -> str:
+    """Email section listing this run's enforced held pages, or '' when there are none."""
+    if not run_id:
+        return ""
+    try:
+        held = fetch_run_alerts(run_id, ("PAGE_HELD",))
+    except Exception:   # noqa: BLE001
+        return ""
+    if not held:
+        return ""
+    lines = ["HELD PAGES — SEV-2, held page, needs human review "
+             "(Gemini asked to page; the paging policy held it):"]
+    lines += [f"  - {a['service']}: {a['message']}" for a in held]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

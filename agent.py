@@ -28,7 +28,9 @@ import json
 import os
 import re
 import sys
+import threading
 import uuid
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import chromadb
@@ -40,7 +42,17 @@ from google.genai.errors import ClientError
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from mock_app.database import log_agent_event
+from laya_config import load_config as load_laya_config
+from laya_triage.evidence import build_evidence_packs
+from laya_triage.prompting import (
+    LAYA_PROMPT_ADDENDUM,
+    advisory_user_message,
+    triage_table,
+    unavailable_triage,
+)
+from dynatrace_client import dt_ingest_tool_dry_run
+from mock_app.database import fetch_run_alerts, log_agent_event, save_laya_triage
+from slack_notify import slack_mode
 
 load_dotenv()
 
@@ -52,8 +64,18 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = "gemini-2.5-flash"
 ANALYSIS_WINDOW_MINUTES = 30
 
-OBS_MCP_SERVER = Path(__file__).parent / "mcp_server.py"
-DT_MCP_SERVER  = Path(__file__).parent / "dynatrace_mcp_server.py"
+OBS_MCP_SERVER  = Path(__file__).parent / "mcp_server.py"
+DT_MCP_SERVER   = Path(__file__).parent / "dynatrace_mcp_server.py"
+LAYA_MCP_SERVER = Path(__file__).parent / "laya_mcp_server.py"
+
+# Tools that receive this run's id (injected here, never supplied by Gemini) so they
+# can look up the run's Laya triage. Only injected when LAYA_ENABLED=true.
+RUN_ID_TOOLS = {"raise_alert", "call_on_call_engineer", "send_email_notification"}
+
+# LAYA-MCP: time to start the server, and an outer bound on classify_services
+# (checkpoint load + inference) on top of the client's own limits.
+LAYA_INIT_TIMEOUT_S = 30
+LAYA_CALL_GRACE_S   = 200
 
 CHROMA_PATH = Path(__file__).parent / "chroma_db"
 COLLECTION  = "observability_docs"
@@ -197,8 +219,83 @@ def _parse_retry_delay(err_str: str, default: int = 65) -> int:
     return default
 
 
+GEMINI_CALL_TIMEOUT_S = float(os.environ.get("GEMINI_CALL_TIMEOUT_S", "180"))
+GEMINI_TRANSIENT_RETRIES = 2
+
+
+class _BoundedChat:
+    """
+    A Gemini chat whose history lives here, so a stalled request can be abandoned.
+
+    google-genai's Chat appends to its history when a response arrives; a request
+    abandoned after a timeout could still arrive later and corrupt the history of
+    the retry. Here every attempt sends a copy of the history and the history only
+    advances when the attempt that is still awaited succeeds.
+    """
+
+    def __init__(self, client, model: str, config):
+        self.client, self.model, self.config = client, model, config
+        self.history: list = []
+
+    @staticmethod
+    def _as_content(message):
+        if isinstance(message, str):
+            return types.Content(role="user", parts=[types.Part(text=message)])
+        return types.Content(role="user", parts=list(message))
+
+    def send_message(self, message, timeout_s: float = GEMINI_CALL_TIMEOUT_S):
+        content = self._as_content(message)
+        contents = self.history + [content]
+        response = _call_with_deadline(
+            lambda: self.client.models.generate_content(
+                model=self.model, contents=contents, config=self.config),
+            timeout_s,
+        )
+        candidate = response.candidates[0] if response.candidates else None
+        if not (candidate and candidate.content and candidate.content.parts):
+            # Seen intermittently: a candidate with no parts. Nothing to act on; retry.
+            reason = getattr(candidate, "finish_reason", None) if candidate else "no candidates"
+            raise EmptyGeminiResponse(f"Gemini returned an empty response (finish_reason={reason})")
+        self.history = contents + [candidate.content]
+        return response
+
+
+def _call_with_deadline(fn, timeout_s: float):
+    """Run fn in a daemon thread; raise TimeoutError if it has not returned in time.
+    (requests' own timeout only covers silence on the socket, not a stalled response.)"""
+    box: dict = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:     # noqa: BLE001 – re-raised in the caller
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True, name="gemini-call").start()
+    if not done.wait(timeout_s):
+        raise TimeoutError(f"Gemini call did not complete within {timeout_s:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+class EmptyGeminiResponse(RuntimeError):
+    """A response with no content parts; treated as transient."""
+
+
+def _is_transient(exc: BaseException) -> bool:
+    import requests
+    return isinstance(exc, (TimeoutError, ConnectionError, EmptyGeminiResponse,
+                            requests.exceptions.ConnectionError, requests.exceptions.Timeout))
+
+
 async def _send_with_retry(chat, message, max_retries: int = 8):
-    """Send a Gemini chat message with backoff on 429 quota errors."""
+    """Send a Gemini chat message with backoff on 429 quota errors, and a bounded
+    retry when a call stalls or the connection drops."""
+    transient = 0
     for attempt in range(max_retries):
         try:
             return await asyncio.to_thread(chat.send_message, message)
@@ -210,11 +307,161 @@ async def _send_with_retry(chat, message, max_retries: int = 8):
                 await asyncio.sleep(delay)
             else:
                 raise
+        except Exception as e:
+            if _is_transient(e) and transient < GEMINI_TRANSIENT_RETRIES:
+                transient += 1
+                print(f"[Agent] Gemini call failed ({type(e).__name__}: {e}) – "
+                      f"retrying ({transient}/{GEMINI_TRANSIENT_RETRIES})…")
+                await asyncio.sleep(5)
+            else:
+                raise
 
 
 # ---------------------------------------------------------------------------
 # Agent loop
 # ---------------------------------------------------------------------------
+
+def _server_params(script: Path) -> StdioServerParameters:
+    """
+    Start an MCP server with the agent's own environment. mcp's stdio_client otherwise
+    passes only HOME/LOGNAME/PATH/SHELL/TERM/USER, and each server then reads .env by
+    itself, so a value set for this run (SLACK_WEBHOOK_URL=, LAYA_MODE=...) never
+    reached the servers. os.environ already holds .env, loaded at import, with
+    explicit environment values taking precedence.
+    """
+    return StdioServerParameters(command=sys.executable, args=[str(script)], env=dict(os.environ))
+
+
+async def _start_laya_session(stack: AsyncExitStack):
+    """Spawn LAYA-MCP. Returns (session, None) or (None, error); never raises."""
+    params = _server_params(LAYA_MCP_SERVER)
+    try:
+        read, write = await stack.enter_async_context(stdio_client(params))
+        session = await stack.enter_async_context(ClientSession(read, write))
+        await asyncio.wait_for(session.initialize(), timeout=LAYA_INIT_TIMEOUT_S)
+        return session, None
+    except Exception as exc:   # noqa: BLE001 – Laya must never stop the agent
+        return None, f"LAYA-MCP failed to start: {type(exc).__name__}: {exc}"
+
+
+async def _logged_call(run_id: str, session: ClientSession, server: str, tool_name: str,
+                       tool_args: dict, timeout: float = None) -> str:
+    """Call an MCP tool from code (not Gemini), logged like the agent's own tool calls."""
+    print(f"[{server} → {tool_name}] (code) {json.dumps(tool_args, default=str)[:200]}")
+    log_agent_event(
+        run_id=run_id,
+        event_type="TOOL_CALL",
+        tool_name=tool_name,
+        tool_input=json.dumps(tool_args, default=str),
+        message=f"Calling {tool_name} via {server} (Laya pre-triage, code)",
+    )
+    try:
+        call = session.call_tool(tool_name, tool_args)
+        mcp_resp = await (asyncio.wait_for(call, timeout) if timeout else call)
+        result = mcp_resp.content[0].text if mcp_resp.content else ""
+    except Exception as exc:
+        log_agent_event(run_id=run_id, event_type="TOOL_ERROR", tool_name=tool_name,
+                        tool_result=f"{type(exc).__name__}: {exc}",
+                        message=f"{tool_name} failed (Laya pre-triage, code)")
+        raise
+    print(f"[{server} ← {tool_name}] (code) {result[:200]}")
+    log_agent_event(
+        run_id=run_id,
+        event_type="TOOL_RESULT",
+        tool_name=tool_name,
+        tool_result=result[:1000],
+        message=f"{tool_name} completed (Laya pre-triage, code)",
+    )
+    return result
+
+
+async def _laya_pretriage(run_id, window_minutes, obs_session, dt_session, laya_session,
+                          laya_error, laya_cfg, laya_mode):
+    """
+    Code, not Gemini: fetch both sources, build evidence packs and ask Laya.
+    Returns (pg, dt, packs, triage). Never raises.
+    """
+    args = {"timeframe_minutes": window_minutes}
+    try:
+        pg = json.loads(await _logged_call(run_id, obs_session, "OBS-MCP", "get_logs", args))
+    except Exception as exc:   # noqa: BLE001
+        pg = {"source": "postgresql", "status": "error", "error": str(exc), "services": []}
+    try:
+        dt = json.loads(await _logged_call(run_id, dt_session, "DT-MCP", "dt_search_logs", args))
+    except Exception as exc:   # noqa: BLE001
+        dt = {"source": "dynatrace", "status": "error", "note": str(exc), "services": []}
+
+    packs = build_evidence_packs(pg, dt, laya_cfg.critical_services)
+
+    triage = None
+    if laya_session is not None:
+        try:
+            text = await _logged_call(
+                run_id, laya_session, "LAYA-MCP", "classify_services",
+                {"evidence_packs": packs, "run_id": run_id, "mode": laya_mode},
+                timeout=laya_cfg.timeout_s + LAYA_CALL_GRACE_S,
+            )
+            triage = json.loads(text)
+        except Exception as exc:   # noqa: BLE001
+            laya_error = f"classify_services failed: {type(exc).__name__}: {exc}"
+    if triage is None:
+        # LAYA-MCP never answered, so it saved nothing: record the gap here.
+        triage = unavailable_triage(packs, laya_cfg.model, laya_error)
+        for pack, result in zip(packs, triage["results"]):
+            save_laya_triage(run_id, laya_mode, laya_cfg.model, pack, result)
+    return pg, dt, packs, triage
+
+
+def _apply_policy_after_loop(run_id: str, mode: str, packs: list,
+                             paged_by_gemini: set, gemini_severity: dict) -> str:
+    """
+    After the Gemini loop: decide for every service Gemini did not page (NO_PAGE or
+    PAGE_FORCED), send forced pages in enforce mode, then return the decision table
+    for this run (the tool already recorded decisions for services Gemini paged).
+    """
+    import tools as obs_tools
+    from policy import PAGE_FORCED
+
+    for pack in packs:
+        service = pack["service"]
+        if service in paged_by_gemini:
+            continue
+        ctx = obs_tools.policy_context(run_id, service)
+        if ctx is None:
+            continue
+        decision = ctx["decide"](gemini_pages=False)
+        obs_tools.record_decision(run_id, service, decision, mode)
+        if mode == "enforce" and decision.outcome == PAGE_FORCED:
+            incident = obs_tools.send_forced_page(
+                run_id, service, decision, gemini_severity.get(service, "not assessed"))
+            print(f"[Policy] PAGE_FORCED {service}: {incident['status']} {incident['incident_id']}")
+            log_agent_event(
+                run_id=run_id,
+                event_type="POLICY_PAGE_FORCED",
+                tool_name="call_on_call_engineer",
+                tool_input=json.dumps({"service": service, "decision": decision.to_dict()}),
+                tool_result=json.dumps(incident)[:1000],
+                severity=1,
+                message=f"Paging policy forced a page for {service}; Gemini did not page",
+            )
+
+    rows = fetch_run_alerts(run_id, obs_tools.POLICY_ALERT_TYPES)
+    if not rows:
+        return ""
+    enforced = mode == "enforce"
+    lines = [
+        f"## Paging policy decisions (mode: {mode}"
+        + ("" if enforced else " — recorded only, not enforced") + ")",
+        "",
+        "| Service | Gemini SEV | Decision | Detail |",
+        "|---------|------------|----------|--------|",
+    ]
+    for r in rows:
+        detail = r["message"].split("] ", 1)[-1].replace("|", "/")
+        lines.append(f"| {r['service']} | {gemini_severity.get(r['service'], 'n/a')} "
+                     f"| {r['status']} | {detail} |")
+    return "\n".join(lines)
+
 
 async def _run_agent_async(window_minutes: int) -> str:
     if not GEMINI_API_KEY:
@@ -224,147 +471,200 @@ async def _run_agent_async(window_minutes: int) -> str:
     client = genai.Client(api_key=GEMINI_API_KEY)
     run_id = str(uuid.uuid4())[:8]
 
-    obs_params = StdioServerParameters(command=sys.executable, args=[str(OBS_MCP_SERVER)])
-    dt_params  = StdioServerParameters(command=sys.executable, args=[str(DT_MCP_SERVER)])
+    laya_cfg  = load_laya_config()
+    laya_mode = laya_cfg.effective_mode() if laya_cfg.enabled else None
 
-    async with stdio_client(obs_params) as (obs_r, obs_w):
-        async with stdio_client(dt_params) as (dt_r, dt_w):
-            async with ClientSession(obs_r, obs_w) as obs_session:
-                async with ClientSession(dt_r, dt_w) as dt_session:
+    obs_params = _server_params(OBS_MCP_SERVER)
+    dt_params  = _server_params(DT_MCP_SERVER)
 
-                    await obs_session.initialize()
-                    await dt_session.initialize()
+    async with AsyncExitStack() as stack:
+        obs_r, obs_w = await stack.enter_async_context(stdio_client(obs_params))
+        dt_r, dt_w   = await stack.enter_async_context(stdio_client(dt_params))
+        obs_session  = await stack.enter_async_context(ClientSession(obs_r, obs_w))
+        dt_session   = await stack.enter_async_context(ClientSession(dt_r, dt_w))
 
-                    obs_tools = (await obs_session.list_tools()).tools
-                    dt_tools  = (await dt_session.list_tools()).tools
+        await obs_session.initialize()
+        await dt_session.initialize()
 
-                    # Merge both tool lists into one Gemini declaration
-                    gemini_tools  = _mcp_tools_to_gemini(obs_tools + dt_tools)
+        laya_session, laya_error = None, None
+        if laya_cfg.enabled:
+            laya_session, laya_error = await _start_laya_session(stack)
 
-                    # Route each tool call to the correct MCP session
-                    dt_tool_names = {t.name for t in dt_tools}
+        obs_tools = (await obs_session.list_tools()).tools
+        dt_tools  = (await dt_session.list_tools()).tools
 
-                    def _session_for(name: str) -> ClientSession:
-                        return dt_session if name in dt_tool_names else obs_session
+        # Merge both tool lists into one Gemini declaration. LAYA-MCP's tool is
+        # called from code only and is deliberately not offered to Gemini.
+        gemini_tools  = _mcp_tools_to_gemini(obs_tools + dt_tools)
 
-                    def _server_label(name: str) -> str:
-                        return "DT-MCP" if name in dt_tool_names else "OBS-MCP"
+        # Route each tool call to the correct MCP session
+        dt_tool_names = {t.name for t in dt_tools}
 
-                    print(f"\n{'='*70}")
-                    print(f"  OBSERVABILITY AGENT  –  Analysing last {window_minutes} minutes")
-                    print(f"  Model   : {MODEL}  |  Run ID: {run_id}")
-                    print(f"  OBS-MCP : {[t.name for t in obs_tools]}")
-                    print(f"  DT-MCP  : {[t.name for t in dt_tools]}")
-                    print(f"{'='*70}\n")
+        def _session_for(name: str) -> ClientSession:
+            return dt_session if name in dt_tool_names else obs_session
+
+        def _server_label(name: str) -> str:
+            return "DT-MCP" if name in dt_tool_names else "OBS-MCP"
+
+        print(f"\n{'='*70}")
+        print(f"  OBSERVABILITY AGENT  –  Analysing last {window_minutes} minutes")
+        print(f"  Model   : {MODEL}  |  Run ID: {run_id}")
+        print(f"  OBS-MCP : {[t.name for t in obs_tools]}")
+        print(f"  DT-MCP  : {[t.name for t in dt_tools]}")
+        print(f"  Slack   : {slack_mode()}"
+              + ("  (payloads logged, no HTTP call; SLACK_DRY_RUN=false to post)"
+                 if slack_mode() == "DRY_RUN" else "  (posts to SLACK_WEBHOOK_URL)"))
+        print(f"  DT tool : dt_ingest_log {'DRY_RUN' if dt_ingest_tool_dry_run() else 'LIVE'}")
+        if laya_cfg.enabled:
+            status = "['classify_services']" if laya_session else f"unavailable ({laya_error})"
+            print(f"  LAYA-MCP: {status}  |  mode={laya_mode}  model={laya_cfg.model}")
+        print(f"{'='*70}\n")
+
+        log_agent_event(
+            run_id=run_id,
+            event_type="RUN_START",
+            message=f"Agent run started. Analysing last {window_minutes} minutes."
+                    + (f" Laya mode={laya_mode}." if laya_cfg.enabled else ""),
+        )
+
+        system_prompt = SYSTEM_PROMPT
+        user_message = (
+            f"Analyse the application logs from the last {window_minutes} minutes. "
+            "Step 1: call get_logs to fetch PostgreSQL data. "
+            "Step 2: call dt_search_logs with the same timeframe to fetch Dynatrace data. "
+            "Step 3: for each service, state the PostgreSQL value, the Dynatrace value, "
+            "and your correlation reasoning before assigning severity. "
+            "Do not estimate any metric — only use values present in the tool responses. "
+            "Then take the appropriate actions (SEV-1 → Slack page, all services → alerts + email), "
+            "save metrics, and write a concise incident report."
+        )
+
+        packs: list = []
+        paged_by_gemini: set = set()
+        gemini_severity: dict = {}
+
+        if laya_cfg.enabled:
+            pg, dt, packs, triage = await _laya_pretriage(
+                run_id, window_minutes, obs_session, dt_session, laya_session,
+                laya_error, laya_cfg, laya_mode)
+            print(triage_table(triage) + "\n")
+            if laya_mode in ("advisory", "enforce"):
+                system_prompt = SYSTEM_PROMPT + LAYA_PROMPT_ADDENDUM
+                user_message = advisory_user_message(window_minutes, pg, dt, packs, triage)
+
+        chat = _BoundedChat(
+            client,
+            MODEL,
+            types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                tools=gemini_tools,
+            ),
+        )
+
+        response = await _send_with_retry(chat, user_message)
+
+        iteration  = 0
+        max_iter   = 25
+        final_text = ""
+
+        while iteration < max_iter:
+            iteration += 1
+            print(f"[Agent] Iteration {iteration}")
+
+            function_calls = []
+            for part in response.candidates[0].content.parts:
+                if part.function_call and part.function_call.name:
+                    function_calls.append(part.function_call)
+                elif part.text:
+                    print(f"\n[Agent Response]\n{part.text}\n")
+                    final_text = part.text
+
+            if not function_calls:
+                print("[Agent] Analysis complete.")
+                break
+
+            tool_response_parts = []
+            for fc in function_calls:
+                tool_name = fc.name
+                tool_args = dict(fc.args)
+                server    = _server_label(tool_name)
+
+                # run_id comes from the agent, never from Gemini.
+                tool_args.pop("run_id", None)
+                if laya_cfg.enabled and tool_name in RUN_ID_TOOLS:
+                    tool_args["run_id"] = run_id
+
+                print(f"[{server} → {tool_name}] {json.dumps(tool_args)[:300]}")
+
+                log_agent_event(
+                    run_id=run_id,
+                    event_type="TOOL_CALL",
+                    tool_name=tool_name,
+                    tool_input=json.dumps(tool_args),
+                    message=f"Calling {tool_name} via {server}",
+                )
+
+                try:
+                    mcp_resp = await _session_for(tool_name).call_tool(
+                        tool_name, tool_args
+                    )
+                    result = mcp_resp.content[0].text if mcp_resp.content else ""
+                    print(f"[{server} ← {tool_name}] {str(result)[:300]}")
+
+                    if tool_name == "call_on_call_engineer":
+                        paged_by_gemini.add(tool_args.get("service"))
+                    elif tool_name == "raise_alert" and not getattr(mcp_resp, "isError", False):
+                        try:
+                            gemini_severity[tool_args.get("service")] = f"SEV-{int(tool_args['severity'])}"
+                        except (KeyError, TypeError, ValueError):
+                            pass
+
+                    sev = None
+                    if tool_name == "save_metrics" and "severity_assessment" in tool_args:
+                        sev = int(tool_args["severity_assessment"])
+                    elif tool_name == "call_on_call_engineer":
+                        sev = 1
 
                     log_agent_event(
                         run_id=run_id,
-                        event_type="RUN_START",
-                        message=f"Agent run started. Analysing last {window_minutes} minutes.",
+                        event_type="TOOL_RESULT",
+                        tool_name=tool_name,
+                        tool_result=str(result)[:1000],
+                        severity=sev,
+                        message=f"{tool_name} completed",
                     )
 
-                    chat = await asyncio.to_thread(
-                        client.chats.create,
-                        model=MODEL,
-                        config=types.GenerateContentConfig(
-                            system_instruction=SYSTEM_PROMPT,
-                            tools=gemini_tools,
-                        ),
+                except Exception as exc:
+                    result = f"Tool execution error: {exc}"
+                    print(f"[{server} Error] {result}")
+                    log_agent_event(
+                        run_id=run_id,
+                        event_type="TOOL_ERROR",
+                        tool_name=tool_name,
+                        tool_result=result,
+                        message=result,
                     )
 
-                    user_message = (
-                        f"Analyse the application logs from the last {window_minutes} minutes. "
-                        "Step 1: call get_logs to fetch PostgreSQL data. "
-                        "Step 2: call dt_search_logs with the same timeframe to fetch Dynatrace data. "
-                        "Step 3: for each service, state the PostgreSQL value, the Dynatrace value, "
-                        "and your correlation reasoning before assigning severity. "
-                        "Do not estimate any metric — only use values present in the tool responses. "
-                        "Then take the appropriate actions (SEV-1 → Slack page, all services → alerts + email), "
-                        "save metrics, and write a concise incident report."
+                tool_response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=tool_name,
+                            response={"result": result},
+                        )
                     )
+                )
 
-                    response = await _send_with_retry(chat, user_message)
+            await asyncio.sleep(2)
+            response = await _send_with_retry(chat, tool_response_parts)
 
-                    iteration  = 0
-                    max_iter   = 25
-                    final_text = ""
-
-                    while iteration < max_iter:
-                        iteration += 1
-                        print(f"[Agent] Iteration {iteration}")
-
-                        function_calls = []
-                        for part in response.candidates[0].content.parts:
-                            if part.function_call and part.function_call.name:
-                                function_calls.append(part.function_call)
-                            elif part.text:
-                                print(f"\n[Agent Response]\n{part.text}\n")
-                                final_text = part.text
-
-                        if not function_calls:
-                            print("[Agent] Analysis complete.")
-                            break
-
-                        tool_response_parts = []
-                        for fc in function_calls:
-                            tool_name = fc.name
-                            tool_args = dict(fc.args)
-                            server    = _server_label(tool_name)
-
-                            print(f"[{server} → {tool_name}] {json.dumps(tool_args)[:300]}")
-
-                            log_agent_event(
-                                run_id=run_id,
-                                event_type="TOOL_CALL",
-                                tool_name=tool_name,
-                                tool_input=json.dumps(tool_args),
-                                message=f"Calling {tool_name} via {server}",
-                            )
-
-                            try:
-                                mcp_resp = await _session_for(tool_name).call_tool(
-                                    tool_name, tool_args
-                                )
-                                result = mcp_resp.content[0].text if mcp_resp.content else ""
-                                print(f"[{server} ← {tool_name}] {str(result)[:300]}")
-
-                                sev = None
-                                if tool_name == "save_metrics" and "severity_assessment" in tool_args:
-                                    sev = int(tool_args["severity_assessment"])
-                                elif tool_name == "call_on_call_engineer":
-                                    sev = 1
-
-                                log_agent_event(
-                                    run_id=run_id,
-                                    event_type="TOOL_RESULT",
-                                    tool_name=tool_name,
-                                    tool_result=str(result)[:1000],
-                                    severity=sev,
-                                    message=f"{tool_name} completed",
-                                )
-
-                            except Exception as exc:
-                                result = f"Tool execution error: {exc}"
-                                print(f"[{server} Error] {result}")
-                                log_agent_event(
-                                    run_id=run_id,
-                                    event_type="TOOL_ERROR",
-                                    tool_name=tool_name,
-                                    tool_result=result,
-                                    message=result,
-                                )
-
-                            tool_response_parts.append(
-                                types.Part(
-                                    function_response=types.FunctionResponse(
-                                        name=tool_name,
-                                        response={"result": result},
-                                    )
-                                )
-                            )
-
-                        await asyncio.sleep(2)
-                        response = await _send_with_retry(chat, tool_response_parts)
+    if laya_cfg.enabled and packs:
+        policy_table = _apply_policy_after_loop(
+            run_id, laya_mode, packs, paged_by_gemini, gemini_severity)
+        if policy_table:
+            print(f"\n{policy_table}\n")
+            # Shadow mode leaves the report unchanged; advisory/enforce append the decisions.
+            if laya_mode in ("advisory", "enforce"):
+                final_text = f"{final_text}\n\n{policy_table}" if final_text else policy_table
 
     log_agent_event(
         run_id=run_id,

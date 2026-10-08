@@ -24,7 +24,9 @@ URL routing:
   Auto-derived from DYNATRACE_ENV_URL regardless of which subdomain is set.
 """
 
+import json
 import os
+import sys
 import time
 import threading
 from collections import defaultdict
@@ -68,6 +70,11 @@ def _apps_url() -> str:
 def is_configured() -> bool:
     """True if DQL querying is available (OAuth token + env URL)."""
     return bool(DT_API_KEY and DT_ENV_URL)
+
+
+def dt_ingest_tool_dry_run() -> bool:
+    """True unless DT_INGEST_TOOL_DRY_RUN is explicitly false. Read on every call."""
+    return os.environ.get("DT_INGEST_TOOL_DRY_RUN", "true").strip().lower() not in ("false", "0", "no", "off")
 
 
 def ingest_configured() -> bool:
@@ -239,16 +246,24 @@ def ingest_log_sync(
     """
     Synchronous log ingest for the Dynatrace MCP tool.
     Uses DYNATRACE_INGEST_KEY (classic dt0c01.* token, logs.ingest scope).
+
+    Dry run by default: unless DT_INGEST_TOOL_DRY_RUN=false, the payload is logged
+    to stderr and returned without any HTTP call. This covers only the dt_ingest_log
+    tool; the mock app's automatic per-request forwarding (ingest_log) stays live.
     """
+    payload = _build_payload(
+        endpoint, method, status_code, response_time_ms, message, request_id, error_detail
+    )
+    if dt_ingest_tool_dry_run():
+        body = json.dumps(payload, ensure_ascii=False)
+        print(f"[DT DRY_RUN] dt_ingest_log would POST /api/v2/logs/ingest: {body}", file=sys.stderr)
+        return f"DRY_RUN: not sent to Dynatrace (set DT_INGEST_TOOL_DRY_RUN=false to send). Payload: {body}"
     if not ingest_configured():
         return (
             "Dynatrace ingest not configured — DYNATRACE_INGEST_KEY is missing. "
             "Create a classic API token (dt0c01.*) at Dynatrace → Access Tokens "
             "with the 'Ingest logs (logs.ingest)' scope and set it as DYNATRACE_INGEST_KEY in .env."
         )
-    payload = _build_payload(
-        endpoint, method, status_code, response_time_ms, message, request_id, error_detail
-    )
     try:
         resp = httpx.post(
             f"{_live_url()}/api/v2/logs/ingest",
@@ -309,19 +324,11 @@ def _query_classic(window_minutes: int) -> list | None:
         raise
 
 
-def _query_dql(window_minutes: int) -> list | None:
+def _run_dql(dql: str) -> list | None:
     """
     POST /platform/storage/query/v1/query:execute on *.apps.dynatrace.com (Grail DQL).
     Polls until SUCCEEDED / FAILED.  Returns list of records or None.
     """
-    dql = (
-        f"fetch logs, from: now()-{window_minutes}m, to: now() "
-        "| filter isNotNull(`service.name`) "
-        "| fields timestamp, content, severity, `service.name`, "
-        "         `http.status_code`, `response_time_ms`, `http.url` "
-        "| sort timestamp desc "
-        "| limit 1000"
-    )
     try:
         resp = httpx.post(
             f"{_apps_url()}/platform/storage/query/v1/query:execute",
@@ -339,7 +346,7 @@ def _query_dql(window_minutes: int) -> list | None:
             if state == "SUCCEEDED":
                 return data.get("result", {}).get("records", [])
             if state in ("FAILED", "CANCELLED"):
-                print(f"[DT] DQL query {state}")
+                print(f"[DT] DQL query {state}", file=sys.stderr)
                 return None
             if state == "RUNNING" and request_token:
                 time.sleep(2)
@@ -357,8 +364,60 @@ def _query_dql(window_minutes: int) -> list | None:
 
         return None
     except Exception as exc:
-        print(f"[DT] DQL query warning: {exc}")
+        print(f"[DT] DQL query warning: {exc}", file=sys.stderr)
         return None
+
+
+def _query_dql(window_minutes: int) -> list | None:
+    """Raw log records (newest 1000 only). Fallback when the summarised query fails."""
+    return _run_dql(
+        f"fetch logs, from: now()-{window_minutes}m, to: now() "
+        "| filter isNotNull(`service.name`) "
+        "| fields timestamp, content, severity, `service.name`, "
+        "         `http.status_code`, `response_time_ms`, `http.url` "
+        "| sort timestamp desc "
+        "| limit 1000"
+    )
+
+
+def _query_dql_summary(window_minutes: int) -> dict | None:
+    """
+    Per-service totals computed by Grail (summarize ... by service.name), so every log
+    in the window counts instead of the newest 1000 rows. Returns the same aggregate
+    shape as _aggregate(), or None if the query fails or returns something unexpected.
+    """
+    records = _run_dql(
+        f"fetch logs, from: now()-{window_minutes}m, to: now() "
+        "| filter isNotNull(`service.name`) "
+        "| summarize total = count(), "
+        "            errors = countIf(toLong(`http.status_code`) >= 500), "
+        "            latency_sum = sum(toDouble(response_time_ms)), "
+        "            latency_n = countIf(isNotNull(toDouble(response_time_ms))), "
+        "            by: {`service.name`}"
+    )
+    if records is None:
+        return None
+    try:
+        services, total, total_errors, lat_sum, lat_n = [], 0, 0, 0.0, 0
+        for r in records:
+            t = int(r["total"])
+            e = int(r.get("errors") or 0)
+            ls = float(r.get("latency_sum") or 0.0)
+            ln = int(r.get("latency_n") or 0)
+            total, total_errors, lat_sum, lat_n = total + t, total_errors + e, lat_sum + ls, lat_n + ln
+            services.append({
+                "service":              r["service.name"],
+                "total_requests":       t,
+                "error_count":          e,
+                "error_rate_pct":       round(e / t * 100, 1) if t else 0.0,
+                "avg_response_time_ms": round(ls / ln, 1) if ln else 0.0,
+            })
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"[DT] DQL summary had an unexpected shape: {exc}", file=sys.stderr)
+        return None
+    return {"total": total, "total_errors": total_errors,
+            "avg_rt": lat_sum / lat_n if lat_n else 0.0,
+            "services": sorted(services, key=lambda s: s["service"])}
 
 
 # ---------------------------------------------------------------------------
@@ -400,13 +459,20 @@ def query_logs(window_minutes: int = 30) -> dict:
             "services": [],
         }
 
+    agg = None
     try:
         results  = _query_classic(window_minutes)
         api_used = "classic (/api/v2/logs/search on live.dynatrace.com)"
 
         if results is None:         # classic endpoint not available → try Grail DQL
-            results  = _query_dql(window_minutes)
-            api_used = "grail-dql (/platform/storage/query/v1/query:execute on apps.dynatrace.com)"
+            agg = _query_dql_summary(window_minutes)
+            api_used = "grail-dql summarize (/platform/storage/query/v1/query:execute on apps.dynatrace.com)"
+            if agg is None:         # summarised query failed → raw records, newest 1000
+                results  = _query_dql(window_minutes)
+                api_used = ("grail-dql records, limit 1000 (fallback) "
+                            "(/platform/storage/query/v1/query:execute on apps.dynatrace.com)")
+            else:
+                results = []
 
         if results is None:
             return {
@@ -445,7 +511,8 @@ def query_logs(window_minutes: int = 30) -> dict:
             "services": [],
         }
 
-    agg   = _aggregate(results)
+    if agg is None:
+        agg = _aggregate(results)
     total = agg["total"]
     errs  = agg["total_errors"]
 
