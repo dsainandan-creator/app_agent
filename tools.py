@@ -281,8 +281,9 @@ def call_on_call_engineer(service: str, message: str, run_id: str = None) -> str
     save_alert(
         severity=1,
         service=service,
-        message=f"[SLACK] {incident['incident_id']}: {message}",
+        message=f"[SLACK {incident['status']}] {incident['incident_id']}: {message}",
         alert_type="ONCALL",
+        status=incident["status"],
     )
 
     return json.dumps(incident)

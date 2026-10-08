@@ -206,16 +206,16 @@ def fetch_logs(window_minutes: int = 30) -> list[dict]:
         conn.close()
 
 
-def save_alert(severity: int, service: str, message: str, alert_type: str):
+def save_alert(severity: int, service: str, message: str, alert_type: str, status: str = "SENT"):
     conn = get_connection()
     try:
         cur = conn.cursor()
         cur.execute(
             """
-            INSERT INTO alerts (severity, service, message, alert_type)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO alerts (severity, service, message, alert_type, status)
+            VALUES (%s, %s, %s, %s, %s)
             """,
-            (severity, service, message, alert_type),
+            (severity, service, message, alert_type, status),
         )
         conn.commit()
     except Exception as exc:

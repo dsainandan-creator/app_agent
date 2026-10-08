@@ -10,3 +10,4 @@ node_modules/
 .claude/
 # local screenshots
 Screenshot *.png
+logs/

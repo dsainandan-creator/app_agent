@@ -133,7 +133,7 @@ def get_summary():
         """
     )
     oncall_count = _query(
-        "SELECT COUNT(*) AS n FROM alerts WHERE alert_type = 'ONCALL'"
+        "SELECT COUNT(*) AS n FROM alerts WHERE alert_type = 'ONCALL' AND status = 'SENT'"
     )
     latest_severity = _query(
         "SELECT severity_assessment FROM metrics ORDER BY timestamp DESC LIMIT 1"

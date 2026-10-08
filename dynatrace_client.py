@@ -24,7 +24,9 @@ URL routing:
   Auto-derived from DYNATRACE_ENV_URL regardless of which subdomain is set.
 """
 
+import json
 import os
+import sys
 import time
 import threading
 from collections import defaultdict
@@ -68,6 +70,11 @@ def _apps_url() -> str:
 def is_configured() -> bool:
     """True if DQL querying is available (OAuth token + env URL)."""
     return bool(DT_API_KEY and DT_ENV_URL)
+
+
+def dt_ingest_tool_dry_run() -> bool:
+    """True unless DT_INGEST_TOOL_DRY_RUN is explicitly false. Read on every call."""
+    return os.environ.get("DT_INGEST_TOOL_DRY_RUN", "true").strip().lower() not in ("false", "0", "no", "off")
 
 
 def ingest_configured() -> bool:
@@ -239,16 +246,24 @@ def ingest_log_sync(
     """
     Synchronous log ingest for the Dynatrace MCP tool.
     Uses DYNATRACE_INGEST_KEY (classic dt0c01.* token, logs.ingest scope).
+
+    Dry run by default: unless DT_INGEST_TOOL_DRY_RUN=false, the payload is logged
+    to stderr and returned without any HTTP call. This covers only the dt_ingest_log
+    tool; the mock app's automatic per-request forwarding (ingest_log) stays live.
     """
+    payload = _build_payload(
+        endpoint, method, status_code, response_time_ms, message, request_id, error_detail
+    )
+    if dt_ingest_tool_dry_run():
+        body = json.dumps(payload, ensure_ascii=False)
+        print(f"[DT DRY_RUN] dt_ingest_log would POST /api/v2/logs/ingest: {body}", file=sys.stderr)
+        return f"DRY_RUN: not sent to Dynatrace (set DT_INGEST_TOOL_DRY_RUN=false to send). Payload: {body}"
     if not ingest_configured():
         return (
             "Dynatrace ingest not configured — DYNATRACE_INGEST_KEY is missing. "
             "Create a classic API token (dt0c01.*) at Dynatrace → Access Tokens "
             "with the 'Ingest logs (logs.ingest)' scope and set it as DYNATRACE_INGEST_KEY in .env."
         )
-    payload = _build_payload(
-        endpoint, method, status_code, response_time_ms, message, request_id, error_detail
-    )
     try:
         resp = httpx.post(
             f"{_live_url()}/api/v2/logs/ingest",

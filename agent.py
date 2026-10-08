@@ -49,7 +49,9 @@ from laya_triage.prompting import (
     triage_table,
     unavailable_triage,
 )
+from dynatrace_client import dt_ingest_tool_dry_run
 from mock_app.database import log_agent_event, save_laya_triage
+from slack_notify import slack_mode
 
 load_dotenv()
 
@@ -374,6 +376,10 @@ async def _run_agent_async(window_minutes: int) -> str:
         print(f"  Model   : {MODEL}  |  Run ID: {run_id}")
         print(f"  OBS-MCP : {[t.name for t in obs_tools]}")
         print(f"  DT-MCP  : {[t.name for t in dt_tools]}")
+        print(f"  Slack   : {slack_mode()}"
+              + ("  (payloads logged, no HTTP call; SLACK_DRY_RUN=false to post)"
+                 if slack_mode() == "DRY_RUN" else "  (posts to SLACK_WEBHOOK_URL)"))
+        print(f"  DT tool : dt_ingest_log {'DRY_RUN' if dt_ingest_tool_dry_run() else 'LIVE'}")
         if laya_cfg.enabled:
             status = "['classify_services']" if laya_session else f"unavailable ({laya_error})"
             print(f"  LAYA-MCP: {status}  |  mode={laya_mode}  model={laya_cfg.model}")
