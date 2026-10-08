@@ -66,6 +66,7 @@ _TOOLS = [
                 "service":  {"type": "string",  "description": "Affected service name."},
                 "severity": {"type": "integer", "description": "Assessed severity: 1=CRITICAL, 2=HIGH, 3=MEDIUM, 4=LOW."},
                 "message":  {"type": "string",  "description": "What you observed, why you chose this severity, and key metrics from both PostgreSQL and Dynatrace."},
+                "run_id":   {"type": "string",  "description": "Set automatically by the agent. Do not supply."},
             },
             "required": ["service", "severity", "message"],
         },
@@ -83,6 +84,7 @@ _TOOLS = [
                 "severity":  {"type": "integer", "description": "Highest severity across all services (1–4)."},
                 "subject":   {"type": "string",  "description": "Email subject line."},
                 "body":      {"type": "string",  "description": "Full summary: all services, severities, data from both sources, and correlation reasoning."},
+                "run_id":    {"type": "string",  "description": "Set automatically by the agent. Do not supply."},
             },
             "required": ["recipient", "severity", "subject", "body"],
         },
@@ -123,6 +125,7 @@ _TOOLS = [
             "properties": {
                 "service": {"type": "string", "description": "The failing service name."},
                 "message": {"type": "string", "description": "Critical failure description — include error rate, latency, and which data source confirmed it."},
+                "run_id":  {"type": "string", "description": "Set automatically by the agent. Do not supply."},
             },
             "required": ["service", "message"],
         },

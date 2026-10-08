@@ -133,7 +133,7 @@ def summarize_logs(rows: list[dict], timeframe_minutes: int) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def raise_alert(service: str, severity: int, message: str) -> str:
+def raise_alert(service: str, severity: int, message: str, run_id: str = None) -> str:
     """
     Persist an alert record in the alerts table and print it.
 
@@ -174,6 +174,7 @@ def send_email_notification(
     severity: int,
     subject: str,
     body: str,
+    run_id: str = None,
 ) -> str:
     """
     Send a mock email alert. Prints to console and persists to DB.
@@ -263,7 +264,7 @@ def save_metrics(
 # Tool 6 – Call on-call engineer
 # ---------------------------------------------------------------------------
 
-def call_on_call_engineer(service: str, message: str) -> str:
+def call_on_call_engineer(service: str, message: str, run_id: str = None) -> str:
     """
     Escalate a Sev-1 critical incident via Slack Incoming Webhook.
     Also persists the escalation in the alerts DB.
