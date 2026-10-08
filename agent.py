@@ -28,6 +28,7 @@ import json
 import os
 import re
 import sys
+import threading
 import uuid
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -218,8 +219,75 @@ def _parse_retry_delay(err_str: str, default: int = 65) -> int:
     return default
 
 
+GEMINI_CALL_TIMEOUT_S = float(os.environ.get("GEMINI_CALL_TIMEOUT_S", "180"))
+GEMINI_TRANSIENT_RETRIES = 2
+
+
+class _BoundedChat:
+    """
+    A Gemini chat whose history lives here, so a stalled request can be abandoned.
+
+    google-genai's Chat appends to its history when a response arrives; a request
+    abandoned after a timeout could still arrive later and corrupt the history of
+    the retry. Here every attempt sends a copy of the history and the history only
+    advances when the attempt that is still awaited succeeds.
+    """
+
+    def __init__(self, client, model: str, config):
+        self.client, self.model, self.config = client, model, config
+        self.history: list = []
+
+    @staticmethod
+    def _as_content(message):
+        if isinstance(message, str):
+            return types.Content(role="user", parts=[types.Part(text=message)])
+        return types.Content(role="user", parts=list(message))
+
+    def send_message(self, message, timeout_s: float = GEMINI_CALL_TIMEOUT_S):
+        content = self._as_content(message)
+        contents = self.history + [content]
+        response = _call_with_deadline(
+            lambda: self.client.models.generate_content(
+                model=self.model, contents=contents, config=self.config),
+            timeout_s,
+        )
+        if response.candidates and response.candidates[0].content:
+            self.history = contents + [response.candidates[0].content]
+        return response
+
+
+def _call_with_deadline(fn, timeout_s: float):
+    """Run fn in a daemon thread; raise TimeoutError if it has not returned in time.
+    (requests' own timeout only covers silence on the socket, not a stalled response.)"""
+    box: dict = {}
+    done = threading.Event()
+
+    def run():
+        try:
+            box["result"] = fn()
+        except BaseException as exc:     # noqa: BLE001 – re-raised in the caller
+            box["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=run, daemon=True, name="gemini-call").start()
+    if not done.wait(timeout_s):
+        raise TimeoutError(f"Gemini call did not complete within {timeout_s:.0f}s")
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _is_transient(exc: BaseException) -> bool:
+    import requests
+    return isinstance(exc, (TimeoutError, ConnectionError, requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout))
+
+
 async def _send_with_retry(chat, message, max_retries: int = 8):
-    """Send a Gemini chat message with backoff on 429 quota errors."""
+    """Send a Gemini chat message with backoff on 429 quota errors, and a bounded
+    retry when a call stalls or the connection drops."""
+    transient = 0
     for attempt in range(max_retries):
         try:
             return await asyncio.to_thread(chat.send_message, message)
@@ -229,6 +297,14 @@ async def _send_with_retry(chat, message, max_retries: int = 8):
                 delay = _parse_retry_delay(err)
                 print(f"[Agent] Rate limited – waiting {delay}s (attempt {attempt + 1}/{max_retries})…")
                 await asyncio.sleep(delay)
+            else:
+                raise
+        except Exception as e:
+            if _is_transient(e) and transient < GEMINI_TRANSIENT_RETRIES:
+                transient += 1
+                print(f"[Agent] Gemini call failed ({type(e).__name__}: {e}) – "
+                      f"retrying ({transient}/{GEMINI_TRANSIENT_RETRIES})…")
+                await asyncio.sleep(5)
             else:
                 raise
 
@@ -468,10 +544,10 @@ async def _run_agent_async(window_minutes: int) -> str:
                 system_prompt = SYSTEM_PROMPT + LAYA_PROMPT_ADDENDUM
                 user_message = advisory_user_message(window_minutes, pg, dt, packs, triage)
 
-        chat = await asyncio.to_thread(
-            client.chats.create,
-            model=MODEL,
-            config=types.GenerateContentConfig(
+        chat = _BoundedChat(
+            client,
+            MODEL,
+            types.GenerateContentConfig(
                 system_instruction=system_prompt,
                 tools=gemini_tools,
             ),
