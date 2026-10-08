@@ -126,14 +126,26 @@ def normalise_answers(answers: dict, triage_cfg: dict, calibration: Optional[dic
 # Backends
 # ---------------------------------------------------------------------------
 
-def _get_router(model: str, calibration_path: Optional[Path]):
+def build_router(config, calibration_path: Optional[Path] = None, device: Optional[str] = None):
+    """A Router for config.model: a local checkpoint when LAYA_MODEL_PATH is set, and the
+    calibration file applied to the Agent when one is given."""
+    from laya import Router
+    kwargs = {"max_loaded": 1}
+    if config.model_path:
+        kwargs["models"] = {config.model: config.model_path}
+    if calibration_path:
+        kwargs["agent_kwargs"] = {"calibration": str(calibration_path)}
+    if device:
+        kwargs["device"] = device
+    return Router(**kwargs)
+
+
+def _get_router(config, calibration_path: Optional[Path]):
     global _router
     with _router_lock:
         if _router is None:
-            from laya import Router
-            kwargs = {"calibration": str(calibration_path)} if calibration_path else {}
-            _router = Router(max_loaded=1, agent_kwargs=kwargs)
-        _router.load(model)
+            _router = build_router(config, calibration_path)
+        _router.load(config.model)
         return _router
 
 
@@ -142,7 +154,7 @@ def warmup(config) -> cf.Future:
     global _load_future
     if _load_future is None and not config.base_url:
         cal = config.calibration_file if config.calibrated else None
-        _load_future = _executor.submit(_get_router, config.model, cal)
+        _load_future = _executor.submit(_get_router, config, cal)
     return _load_future
 
 

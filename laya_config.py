@@ -31,6 +31,7 @@ DEFAULTS = {
     "LAYA_ENABLED":          "false",
     "LAYA_MODE":             "shadow",
     "LAYA_MODEL":            "typed-decisions",
+    "LAYA_MODEL_PATH":       "",
     "LAYA_BASE_URL":         "",
     "LAYA_API_KEY":          "",
     "LAYA_TIMEOUT_S":        "5",
@@ -59,6 +60,7 @@ class LayaConfig:
     enabled: bool
     mode: str
     model: str
+    model_path: str
     base_url: str
     api_key: str
     timeout_s: float
@@ -103,6 +105,7 @@ def load_config(env=None) -> LayaConfig:
         enabled=enabled,
         mode=_get(env, "LAYA_MODE").lower(),
         model=_get(env, "LAYA_MODEL").lower(),
+        model_path=_get(env, "LAYA_MODEL_PATH"),
         base_url=_get(env, "LAYA_BASE_URL").rstrip("/"),
         api_key=_get(env, "LAYA_API_KEY"),
         timeout_s=float(_get(env, "LAYA_TIMEOUT_S")),

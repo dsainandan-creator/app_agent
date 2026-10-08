@@ -11,3 +11,5 @@ node_modules/
 # local screenshots
 Screenshot *.png
 logs/
+laya_triage/training/data/
+laya_triage/training/out/
