@@ -38,12 +38,12 @@ Then in `.env`:
 LAYA_BASE_URL=http://localhost:8100
 ```
 
-Endpoints used by `laya/client.py`: `POST /v1/systemone/batch`
+Endpoints used by `laya_triage/client.py`: `POST /v1/systemone/batch`
 (`{"model", "states", "questions"}` → `{"results": [...]}`), with
 `POST /v1/systemone` as the single-request form.
 
 **Calibration over HTTP.** `laya-serve` applies the checkpoint's own temperatures
-and has no setting for a calibration file. When `laya/calibration.json` exists,
-`laya/client.py` re-scales the returned probabilities on the client. This gives
+and has no setting for a calibration file. When `laya_triage/calibration.json` exists,
+`laya_triage/client.py` re-scales the returned probabilities on the client. This gives
 exactly `softmax(z / T_fitted)`, because the server returned `softmax(z / T_shipped)`
 and the calibration file records both temperatures.

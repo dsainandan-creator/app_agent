@@ -41,16 +41,32 @@ def _infer_service(endpoint: str) -> str:
     return "api-gateway"
 
 
+MAX_ERROR_SAMPLES = 5
+
+
 def get_logs(timeframe_minutes: int = 30) -> str:
     """
     Retrieve aggregated log statistics from the last N minutes.
     Returns overall stats plus a per-service breakdown — no raw rows.
     """
     rows = fetch_logs(window_minutes=timeframe_minutes)
+    return json.dumps(summarize_logs(rows, timeframe_minutes), default=str)
 
+
+def summarize_logs(rows: list[dict], timeframe_minutes: int) -> dict:
+    """
+    Aggregate log rows (newest first, as fetch_logs returns them) into the
+    get_logs payload. Pure, so it can be tested without a database.
+
+    Fields added for Laya triage (additive; the original fields are unchanged):
+      overall/services: client_error_count, client_error_rate_pct (4xx)
+      services:         error_samples – up to 5 distinct error_detail texts from
+                        the most recent 5xx rows
+    """
     total = len(rows)
     errors = [r for r in rows if r.get("status_code", 0) >= 500]
     successes = [r for r in rows if r.get("status_code", 0) < 400]
+    client_errors = [r for r in rows if 400 <= r.get("status_code", 0) < 500]
 
     overall_error_rate = (len(errors) / total * 100) if total else 0.0
     overall_avg_rt = (
@@ -60,19 +76,29 @@ def get_logs(timeframe_minutes: int = 30) -> str:
 
     # Per-service aggregation
     from collections import defaultdict
-    svc_buckets: dict = defaultdict(lambda: {"total": 0, "errors": 0, "latencies": []})
+    svc_buckets: dict = defaultdict(
+        lambda: {"total": 0, "errors": 0, "client_errors": 0, "latencies": [], "samples": []}
+    )
     for r in rows:
         svc = _infer_service(r.get("endpoint", ""))
-        svc_buckets[svc]["total"] += 1
+        b = svc_buckets[svc]
+        b["total"] += 1
         if r.get("response_time_ms"):
-            svc_buckets[svc]["latencies"].append(r["response_time_ms"])
-        if r.get("status_code", 0) >= 500:
-            svc_buckets[svc]["errors"] += 1
+            b["latencies"].append(r["response_time_ms"])
+        status = r.get("status_code", 0)
+        if status >= 500:
+            b["errors"] += 1
+            detail = (r.get("error_detail") or "").strip()
+            if detail and detail not in b["samples"] and len(b["samples"]) < MAX_ERROR_SAMPLES:
+                b["samples"].append(detail)
+        elif status >= 400:
+            b["client_errors"] += 1
 
     services = []
     for svc, b in sorted(svc_buckets.items()):
         t = b["total"]
         e = b["errors"]
+        c = b["client_errors"]
         avg = sum(b["latencies"]) / len(b["latencies"]) if b["latencies"] else 0.0
         services.append({
             "service": svc,
@@ -80,9 +106,12 @@ def get_logs(timeframe_minutes: int = 30) -> str:
             "error_count": e,
             "error_rate_pct": round(e / t * 100, 1) if t else 0.0,
             "avg_response_time_ms": round(avg, 1),
+            "client_error_count": c,
+            "client_error_rate_pct": round(c / t * 100, 1) if t else 0.0,
+            "error_samples": b["samples"],
         })
 
-    result = {
+    return {
         "source": "postgresql",
         "status": "ok",
         "window_minutes": timeframe_minutes,
@@ -92,10 +121,11 @@ def get_logs(timeframe_minutes: int = 30) -> str:
             "success_count": len(successes),
             "error_rate_pct": round(overall_error_rate, 1),
             "avg_response_time_ms": round(overall_avg_rt, 1),
+            "client_error_count": len(client_errors),
+            "client_error_rate_pct": round(len(client_errors) / total * 100, 1) if total else 0.0,
         },
         "services": services,
     }
-    return json.dumps(result, default=str)
 
 
 # ---------------------------------------------------------------------------

@@ -36,7 +36,7 @@ DEFAULTS = {
     "LAYA_TIMEOUT_S":        "5",
     "LAYA_PAGE_HIGH":        "0.80",
     "LAYA_PAGE_LOW":         "0.40",
-    "LAYA_CALIBRATION_FILE": "laya/calibration.json",
+    "LAYA_CALIBRATION_FILE": "laya_triage/calibration.json",
     "HARD_FLOOR_ERR_PCT":    "50",
     "CRITICAL_SERVICES":     "payment-service",
 }
@@ -77,7 +77,7 @@ class LayaConfig:
             if warn:
                 print(
                     f"[Laya] WARNING: LAYA_MODE=enforce but {self.calibration_file} is missing. "
-                    "Running as advisory until calibration is fitted (laya/training/calibrate.py).",
+                    "Running as advisory until calibration is fitted (laya_triage/training/calibrate.py).",
                     file=sys.stderr,
                 )
             return "advisory"
