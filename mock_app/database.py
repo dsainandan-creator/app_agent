@@ -80,12 +80,53 @@ def init_db():
             )
         """)
 
+        _create_laya_triage(cur)
+
         conn.commit()
         print("[DB] Schema initialised.")
     except Exception as exc:
         conn.rollback()
         print(f"[DB] Init error: {exc}")
         raise
+    finally:
+        cur.close()
+        conn.close()
+
+
+def _create_laya_triage(cur):
+    """Laya triage results, one row per service per agent run. Idempotent."""
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS laya_triage (
+            id           SERIAL PRIMARY KEY,
+            run_id       VARCHAR(50),
+            service      VARCHAR(255),
+            mode         VARCHAR(20),
+            model        VARCHAR(50),
+            evidence     JSONB,
+            answers      JSONB,
+            expected_sev FLOAT,
+            confidence   FLOAT,
+            latency_ms   FLOAT,
+            created_at   TIMESTAMPTZ DEFAULT NOW()
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS laya_triage_run_id ON laya_triage (run_id)")
+
+
+_laya_table_ready = False
+
+
+def _ensure_laya_triage():
+    """Create laya_triage on first use, for a mock app started before it existed."""
+    global _laya_table_ready
+    if _laya_table_ready:
+        return
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        _create_laya_triage(cur)
+        conn.commit()
+        _laya_table_ready = True
     finally:
         cur.close()
         conn.close()
@@ -210,6 +251,58 @@ def log_agent_event(
     except Exception as exc:
         conn.rollback()
         print(f"[DB] agent_runs insert error: {exc}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def save_laya_triage(run_id: str, mode: str, model: str, evidence: dict, result: dict):
+    """Persist one service's Laya triage result (status ok or unavailable)."""
+    _ensure_laya_triage()
+    laya = result.get("laya") or {}
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO laya_triage
+                (run_id, service, mode, model, evidence, answers,
+                 expected_sev, confidence, latency_ms)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                run_id,
+                result.get("service") or evidence.get("service"),
+                mode,
+                model,
+                psycopg2.extras.Json(evidence),
+                psycopg2.extras.Json(result),
+                laya.get("expected_sev"),
+                laya.get("confidence"),
+                laya.get("latency_ms"),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"[DB] laya_triage insert error: {exc}")
+    finally:
+        cur.close()
+        conn.close()
+
+
+def fetch_laya_triage(run_id: str) -> dict:
+    """This run's triage rows, keyed by service: {service: {"evidence": ..., "answers": ...}}."""
+    _ensure_laya_triage()
+    conn = get_connection()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT service, mode, model, evidence, answers FROM laya_triage "
+            "WHERE run_id = %s ORDER BY id",
+            (run_id,),
+        )
+        return {row["service"]: dict(row) for row in cur.fetchall()}
     finally:
         cur.close()
         conn.close()
