@@ -6,4 +6,14 @@ python-dotenv==1.0.1
 httpx==0.27.2
 mcp>=1.0.0
 chromadb>=1.5.0
+# openai is not imported anywhere right now (embed_docs.py uses ChromaDB's local
+# embedder). Kept on purpose; remove only after confirming nothing needs it.
 openai>=1.0.0
+
+# Laya severity triage (laya_config.py). Pinned to the versions verified in .venv.
+# The [serve] extra adds laya-serve (fastapi, uvicorn, python-multipart, all already
+# satisfied above). Do not install laya[mcp]: it needs mcp>=2.2, which conflicts with
+# the mcp 1.x servers in this repo.
+laya[serve]==0.3.22
+torch==2.14.1
+transformers==5.18.0
